@@ -1,5 +1,14 @@
 #!/bin/sh
 
+
+# Description: Convert audiobooks from m4b to opus
+# Detailed notes: https://notes.ameri.coffee/m/jKSdJDVwP9zMkxxUNCnj3Z
+# Requirements:
+# ffmpeg and GNU Parallel installed on the system
+# Note on performance:
+# The script parallelises the conversion process and creates
+# as many ffmpeg processes as there are cores on the system.
+
 # Enable job control
 set -m
 
@@ -22,22 +31,20 @@ debug_print() {
     [ "$DEBUG" = "1" ] && printf "%s\n" "DEBUG: $1" >&2
 }
 
-# Cleanup function with robust process handling
+# Cleanup function
 cleanup() {
     printf "\n%s\n" "Script interrupted. Cleaning up..."
 
     debug_print "Starting cleanup process"
     debug_print "Script PID: $SCRIPT_PID, PGID: $SCRIPT_PGID"
 
-    # Kill all processes in our process group
+    # Kill all processes
     kill -TERM -"$SCRIPT_PGID" 2>/dev/null
     debug_print "Sent TERM signal to process group"
 
     # Kill specific ffmpeg processes spawned by this script
     pkill -P "$SCRIPT_PID" ffmpeg 2>/dev/null
     debug_print "Sent kill signal to ffmpeg processes"
-
-    # Wait briefly for processes to terminate
     sleep 1
 
     # Force kill any remaining processes
@@ -60,24 +67,24 @@ cleanup() {
 # Set up traps
 trap cleanup INT TERM QUIT PIPE HUP
 
-# Create temporary files for atomic operations
+# Create temporary files
 tmp_file=$(mktemp) || exit 1
 counter_total=$(mktemp) || exit 1
 counter_skipped=$(mktemp) || exit 1
 counter_converted=$(mktemp) || exit 1
 
-# Initialize counters
+# Initialise counters
 printf "0\n" > "$counter_total"
 printf "0\n" > "$counter_skipped"
 printf "0\n" > "$counter_converted"
 
-# Function to format time in HH:MM:SS
+# Format time in HH:MM:SS
 format_time() {
     seconds=$1
     printf "%02d:%02d:%02d" $((seconds/3600)) $((seconds%3600/60)) $((seconds%60))
 }
 
-# Function to check if terminal supports carriage return
+# Check if terminal supports carriage return
 check_terminal() {
     if [ -t 1 ]; then
         CR="\r"
@@ -86,7 +93,7 @@ check_terminal() {
     fi
 }
 
-# Function to get file size in MB
+# Get file size in MB
 get_file_size() {
     if [ -f "$1" ]; then
         size=$(ls -l "$1" | awk '{print $5}')
@@ -96,12 +103,12 @@ get_file_size() {
     fi
 }
 
-# Function to sanitize file paths
+# Sanitise file paths
 sanitize_path() {
     printf "%s" "$1" | sed 's/[^[:alnum:]._/-]/_/g'
 }
 
-# Function to convert a single file
+# Convert a single file
 convert_file() {
     input="$1"
     output="${input%.m4b}.opus"
@@ -142,7 +149,7 @@ convert_file() {
     ffmpeg_pid=$!
     debug_print "Started ffmpeg process with PID: $ffmpeg_pid"
 
-    # Monitor progress with safer arithmetic
+    # Monitor progress
     while kill -0 $ffmpeg_pid 2>/dev/null; do
         if [ -f "$progress_file" ]; then
             current_time=$(grep "out_time=" "$progress_file" | tail -n1 | cut -d'=' -f2)
@@ -204,7 +211,7 @@ printf "%s\n" "Starting conversion process..."
 printf "Looking for .m4b files in and under: %s\n" "${1:-.}"
 printf "%s\n" "-------------------"
 
-# Find all .m4b files without corresponding .opus
+# Find all .m4b files without a corresponding .opus file
 find "${1:-.}" -type f -name "*.m4b" ! -exec sh -c 'test -f "${1%.m4b}.opus"' sh {} \; -print0 | tr '\0' '\n' > "$tmp_file"
 
 # Check if any files were found
@@ -213,7 +220,7 @@ if [ ! -s "$tmp_file" ]; then
     cleanup
 fi
 
-# Print only files to be converted
+# Print files to be converted
 printf "%s\n" "Found the following .m4b files to convert:"
 while IFS= read -r file; do
     printf "%s\n" "$file"
@@ -225,7 +232,7 @@ printf "%s\n" "-------------------"
 printf "Total files to convert: %d\n" "$total_found"
 printf "%s\n" "-------------------"
 
-# Ask for confirmation
+# Ask for confirmation to proceed
 printf "%s" "Proceed with conversion? (y/n): "
 read -r choice
 case "$choice" in
