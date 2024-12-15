@@ -1,7 +1,9 @@
 #!/bin/bash
 
-# Function to generate a MAC address based on the hostname and virtualisation platform
+# Description: Function to generate a MAC address based on the hostname and virtualisation platform
+# https://notes.ameri.coffee/m/7Uc8vPDJUrQxKHHdNGNtW5
 # Inspired by Alain Kelder http://giantdorks.org/alain/how-to-generate-a-unique-mac-address/
+
 my_mac_generator()
 {
   # Prompt for hostname
