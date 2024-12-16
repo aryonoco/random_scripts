@@ -1,9 +1,11 @@
 #!/bin/sh
 
-# cleanup_mac_junk.sh - Clean up macOS-specific metadata files and directories
+# Description: https://notes.ameri.coffee/m/e4eonVD7jfdwPUtLMtSjgC
+
+# cleanup_mac_junk.sh - Clean up macOS-specific metadata junk files
 #
 # This script removes various macOS-specific files and directories that are often
-# created on network shares and external drives, including:
+# created on network shares and external storage, including:
 # - .DS_Store (Desktop Services Store files)
 # - ._* files (AppleDouble files containing extended attributes)
 # - .AppleDouble directories
@@ -108,7 +110,7 @@ tmp_count=$(mktemp)
 tmp_size=$(mktemp)
 trap 'rm -f $tmp_count $tmp_size' EXIT
 
-# Initialize counters in files
+# Initializs counters in files
 echo "0" > "$tmp_count"
 echo "0" > "$tmp_size"
 
@@ -120,7 +122,7 @@ if [ $quiet -eq 0 ]; then
     fi
 fi
 
-# Construct find command with proper directory exclusion
+# Construct find command with directory exclusion
 if [ -n "$exclude_dirs" ]; then
     find_cmd="find . -type d \( -name ${exclude_dirs} \) -prune -o \( \
         -name '.DS_Store' -o \
@@ -188,7 +190,7 @@ if [ $force -eq 0 ] && [ $dry_run -eq 0 ]; then
     esac
 fi
 
-# Perform deletion
+# Delete files if not in dry run mode
 if [ $dry_run -eq 1 ]; then
     if [ $quiet -eq 0 ]; then
         printf "\nDry run - no files will be deleted.\n"
