@@ -1,6 +1,8 @@
 #!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
 
-# Description: Function to generate a MAC address based on the hostname and virtualisation platform
+# Description: Function to generate a MAC address based on the hostname and virtualization platform
 # https://notes.ameri.coffee/m/7Uc8vPDJUrQxKHHdNGNtW5
 # Inspired by Alain Kelder http://giantdorks.org/alain/how-to-generate-a-unique-mac-address/
 
@@ -9,14 +11,19 @@ my_mac_generator()
   # Prompt for hostname
   echo "Enter hostname:"
   read -p "Hostname: " hostname
-
+  hostname=$(echo "$hostname" | xargs)
+  
+  # Remove all characters except A-Za-z0-9-
+  hostname="${hostname//[^A-Za-z0-9-]/}"
+  
   # Validate hostname
   if [[ ! "$hostname" =~ ^[A-Za-z0-9-]+$ ]]; then
+    echo "Entered hostname was: '$hostname'"
     echo "Invalid hostname. Only A-Z, a-z, 0-9, and '-' are allowed."
     exit 1
   fi
 
-  echo "Please select virtualisation platform:"
+  echo "Please select virtualization platform:"
   echo "1. Proxmox"
   echo "2. Xen/LXC"
   echo "3. VMWare"
