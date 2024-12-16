@@ -111,7 +111,7 @@ find . \( \
     -name ".AppleDB" -o \
     -name ".AppleDesktop" -o \
     -name ".Trashes" \
-    \) -print0 | while IFS= read -r -d '' file; do
+    \) | while IFS= read -r file; do
     if [ -f "$file" ]; then
         size=$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null)
         total_size=$((total_size + size))
@@ -172,7 +172,7 @@ else
         -name ".AppleDB" -o \
         -name ".AppleDesktop" -o \
         -name ".Trashes" \
-        \) -print0 | xargs -0 rm -rf 2>/dev/null || {
+        \) -exec rm -rf {} + 2>/dev/null || {
         error "Some files could not be deleted (permission denied)"
         exit 1
     }
