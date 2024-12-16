@@ -9,47 +9,35 @@
 # - .AppleDouble directories
 # - .AppleDB and .AppleDesktop directories
 # - .Trashes directories
-#
-# Usage examples:
-#   ./cleanup_mac_junk.sh              # Clean current directory with confirmation
-#   ./cleanup_mac_junk.sh -n           # Dry run (show what would be deleted)
-#   ./cleanup_mac_junk.sh -f           # Force delete without confirmation
-#   ./cleanup_mac_junk.sh -q           # Quiet mode (minimal output)
-#   ./cleanup_mac_junk.sh /some/path   # Clean specific directory
-#   ./cleanup_mac_junk.sh -qf /path    # Force quiet clean of specific directory
-#
-# Options:
-#   -h  Show help message
-#   -n  Dry run (don't actually delete files)
-#   -f  Force deletion (don't ask for confirmation)
-#   -q  Quiet mode (minimal output)
 
 # Default values
 dry_run=0
 force=0
 quiet=0
 target_dir="."
-
-# Print usage information
-usage() {
-    cat << EOF
-Usage: $(basename "$0") [-h] [-n] [-f] [-q] [directory]
-Clean up macOS-specific files and directories recursively.
-
-Options:
-    -h  Show this help message
-    -n  Dry run (don't actually delete files)
-    -f  Force deletion (don't ask for confirmation)
-    -q  Quiet mode (minimal output)
-
-If directory is not specified, current directory is used.
-EOF
-    exit 1
-}
+exclude_dirs=""
 
 # Print error message to stderr
 error() {
     printf "Error: %s\n" "$1" >&2
+}
+
+# Print usage information
+usage() {
+    cat << EOF
+Usage: $(basename "$0") [-h] [-n] [-f] [-q] [--exclude dir] [directory]
+Clean up macOS-specific files and directories recursively.
+
+Options:
+    -h, --help     Show this help message
+    -n, --dry-run  Dry run (don't actually delete files)
+    -f, --force    Force deletion (don't ask for confirmation)
+    -q, --quiet    Quiet mode (minimal output)
+    --exclude dir  Exclude specified directory from search
+
+If directory is not specified, current directory is used.
+EOF
+    exit 1
 }
 
 # Format size in human readable format
@@ -66,26 +54,47 @@ format_size() {
 }
 
 # Process command line options
-while getopts "hnfq" opt; do
-    case $opt in
-        h) usage ;;
-        n) dry_run=1 ;;
-        f) force=1 ;;
-        q) quiet=1 ;;
-        ?) usage ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            usage
+            ;;
+        --dry-run|-n)
+            dry_run=1
+            ;;
+        --force|-f)
+            force=1
+            ;;
+        --quiet|-q)
+            quiet=1
+            ;;
+        --exclude)
+            shift
+            if [ $# -eq 0 ]; then
+                error "--exclude requires a directory argument"
+                exit 1
+            fi
+            exclude_dirs="$exclude_dirs${exclude_dirs:+ -o -name }'$1'"
+            ;;
+        -*)
+            error "Unknown option: $1"
+            usage
+            ;;
+        *)
+            if [ -n "$target_dir" ] && [ "$target_dir" != "." ]; then
+                error "Multiple directory arguments specified"
+                usage
+            fi
+            target_dir="$1"
+            ;;
     esac
+    shift
 done
 
-# Shift past the options
-shift $((OPTIND - 1))
-
 # Check if directory parameter is provided
-if [ $# -gt 0 ]; then
-    target_dir="$1"
-    if [ ! -d "$target_dir" ]; then
-        error "Directory '$target_dir' does not exist"
-        exit 1
-    fi
+if [ ! -d "$target_dir" ]; then
+    error "Directory '$target_dir' does not exist"
+    exit 1
 fi
 
 # Change to target directory
@@ -106,36 +115,44 @@ echo "0" > "$tmp_size"
 # First pass: count and display files
 if [ $quiet -eq 0 ]; then
     printf "Scanning for macOS-specific files in '%s'...\n" "$target_dir"
+    if [ -n "$exclude_dirs" ]; then
+        printf "Excluding directories matching: %s\n" "$exclude_dirs"
+    fi
 fi
 
 # Construct find command with proper directory exclusion
-find_cmd="find . -type d \( -name '.snapshots' -o -name '@eaDir' \) -prune -o \( \
-    -name '.DS_Store' -o \
-    -name '._*' -o \
-    -name '.AppleDouble' -o \
-    -name '.AppleDB' -o \
-    -name '.AppleDesktop' -o \
-    -name '.Trashes' \
-    \) -print"
+if [ -n "$exclude_dirs" ]; then
+    find_cmd="find . -type d \( -name ${exclude_dirs} \) -prune -o \( \
+        -name '.DS_Store' -o \
+        -name '._*' -o \
+        -name '.AppleDouble' -o \
+        -name '.AppleDB' -o \
+        -name '.AppleDesktop' -o \
+        -name '.Trashes' \
+        \) -type f -print"
+else
+    find_cmd="find . \( \
+        -name '.DS_Store' -o \
+        -name '._*' -o \
+        -name '.AppleDouble' -o \
+        -name '.AppleDB' -o \
+        -name '.AppleDesktop' -o \
+        -name '.Trashes' \
+        \) -type f -print"
+fi
 
 # Execute the find command
 eval "$find_cmd" | while IFS= read -r file; do
-    if [ -f "$file" ]; then
-        size=$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo "0")
-        case "$size" in
-            ''|*[!0-9]*) size=0 ;;
-        esac
-        count=$(cat "$tmp_count")
-        total_size=$(cat "$tmp_size")
-        echo "$((count + 1))" > "$tmp_count"
-        echo "$((total_size + size))" > "$tmp_size"
-        if [ $quiet -eq 0 ]; then
-            printf "File: %s (Size: %s)\n" "$file" "$(format_size "$size")"
-        fi
-    else
-        if [ $quiet -eq 0 ]; then
-            printf "Directory: %s\n" "$file"
-        fi
+    size=$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo "0")
+    case "$size" in
+        ''|*[!0-9]*) size=0 ;;
+    esac
+    count=$(cat "$tmp_count")
+    total_size=$(cat "$tmp_size")
+    echo "$((count + 1))" > "$tmp_count"
+    echo "$((total_size + size))" > "$tmp_size"
+    if [ $quiet -eq 0 ]; then
+        printf "File: %s (Size: %s)\n" "$file" "$(format_size "$size")"
     fi
 done
 
@@ -171,7 +188,7 @@ if [ $force -eq 0 ] && [ $dry_run -eq 0 ]; then
     esac
 fi
 
-# Perform deletion with proper directory exclusion
+# Perform deletion
 if [ $dry_run -eq 1 ]; then
     if [ $quiet -eq 0 ]; then
         printf "\nDry run - no files will be deleted.\n"
@@ -180,17 +197,20 @@ else
     if [ $quiet -eq 0 ]; then
         printf "\nDeleting files...\n"
     fi
-    find . -type d \( -name '.snapshots' -o -name '@eaDir' \) -prune -o \( \
-        -name '.DS_Store' -o \
-        -name '._*' -o \
-        -name '.AppleDouble' -o \
-        -name '.AppleDB' -o \
-        -name '.AppleDesktop' -o \
-        -name '.Trashes' \
-        \) -type f -exec rm -f {} + 2>/dev/null || {
-        error "Some files could not be deleted (permission denied)"
-        exit 1
-    }
+
+    # Use the same find command for deletion
+    if [ -n "$exclude_dirs" ]; then
+        eval "$find_cmd -exec rm -f {} + 2>/dev/null" || {
+            error "Some files could not be deleted (permission denied)"
+            exit 1
+        }
+    else
+        eval "$find_cmd -exec rm -f {} + 2>/dev/null" || {
+            error "Some files could not be deleted (permission denied)"
+            exit 1
+        }
+    fi
+
     if [ $quiet -eq 0 ]; then
         printf "Cleanup completed successfully.\n"
     fi
