@@ -94,10 +94,14 @@ cd "$target_dir" || {
     exit 1
 }
 
-# Initialize counters
-total_size=0
-total_files=0
-total_dirs=0
+# Create temporary files for storing results
+tmp_count=$(mktemp)
+tmp_size=$(mktemp)
+trap 'rm -f $tmp_count $tmp_size' EXIT
+
+# Initialize counters in files
+echo "0" > "$tmp_count"
+echo "0" > "$tmp_size"
 
 # First pass: count and display files
 if [ $quiet -eq 0 ]; then
@@ -113,22 +117,30 @@ find . \( \
     -name ".Trashes" \
     \) | while IFS= read -r file; do
     if [ -f "$file" ]; then
-        size=$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null)
-        total_size=$((total_size + size))
-        total_files=$((total_files + 1))
+        size=$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo "0")
+        case "$size" in
+            ''|*[!0-9]*) size=0 ;;
+        esac
+        count=$(cat "$tmp_count")
+        total_size=$(cat "$tmp_size")
+        echo "$((count + 1))" > "$tmp_count"
+        echo "$((total_size + size))" > "$tmp_size"
         if [ $quiet -eq 0 ]; then
             printf "File: %s (Size: %s)\n" "$file" "$(format_size "$size")"
         fi
     else
-        total_dirs=$((total_dirs + 1))
         if [ $quiet -eq 0 ]; then
             printf "Directory: %s\n" "$file"
         fi
     fi
 done
 
+# Get final counts
+total_files=$(cat "$tmp_count")
+total_size=$(cat "$tmp_size")
+
 # Check if any files were found
-if [ $total_files -eq 0 ] && [ $total_dirs -eq 0 ]; then
+if [ "$total_files" -eq 0 ]; then
     if [ $quiet -eq 0 ]; then
         printf "No macOS-specific files found.\n"
     fi
@@ -139,7 +151,6 @@ fi
 if [ $quiet -eq 0 ]; then
     printf "\nSummary:\n"
     printf "Files: %d\n" "$total_files"
-    printf "Directories: %d\n" "$total_dirs"
     printf "Total size: %s\n" "$(format_size "$total_size")"
 fi
 
