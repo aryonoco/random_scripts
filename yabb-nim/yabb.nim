@@ -306,64 +306,38 @@ proc releaseLock() =
       stderr.writeLine("Warning: Failed to remove lock file: " & config.lockFile)
 
 proc findParentSnapshot(): Option[string] =
-  # Use btrfs subvolume list with -t to get transaction IDs for reliable ordering
-  var cmd = newShellCommand()
-  cmd.addArg("btrfs")
-  cmd.addArg("subvolume")
-  cmd.addArg("list")
-  cmd.addArg("-t")  # Include timestamps
-  cmd.addArg("-o")  # Only list subvolumes in the specified path
-  cmd.addArg(config.snapDir)
+  echo "Looking for parent snapshot..."
   
-  let cmdResult = execShellCmd(cmd)
-  if cmdResult.exitCode != 0:
-    echo "Warning: Failed to get subvolume list. Falling back to filesystem metadata."
-    # Fall back to old method if btrfs command fails
-    var snapshots: seq[string]
-    for (kind, path) in walkDir(config.snapDir, checkDir = true):
-      if kind == pcDir and path.extractFilename.startsWith(sourceBase):
-        snapshots.add(path)
-    
-    snapshots.sort(proc(a, b: string): int = cmp(getLastModificationTime(b), getLastModificationTime(a)))
-    
-    for snap in snapshots:
-      if snap != config.snapDir / snapName:
-        return some(snap.extractFilename)
+  # First get a list of all snapshots from filesystem
+  var availableSnapshots: seq[string] = @[]
+  for (kind, path) in walkDir(config.snapDir, checkDir = true):
+    if kind == pcDir and path.extractFilename.startsWith(sourceBase):
+      let snapBasename = path.extractFilename
+      # Make sure it's not the current snapshot we're creating
+      if snapBasename != snapName:
+        # Also verify it exists on destination for incremental backup
+        if dirExists(config.destMount / snapBasename):
+          availableSnapshots.add(snapBasename)
+          echo &"  Found snapshot: {snapBasename}"
+        else:
+          echo &"  Skipping snapshot not on destination: {snapBasename}"
+  
+  if availableSnapshots.len == 0:
+    echo "No existing snapshots found on both source and destination"
     return none(string)
   
-  # Process the output of btrfs subvolume list -t
-  type SnapInfo = tuple[path: string, ctime: int64]
-  var snapshotInfo: seq[SnapInfo] = @[]
+  # Sort by timestamp in the filename (most recent first)
+  availableSnapshots.sort(proc(a, b: string): int =
+    # Extract timestamp part after the prefix
+    let 
+      tsA = a[sourceBase.len+1 .. ^1]
+      tsB = b[sourceBase.len+1 .. ^1]
+    # Reverse comparison (newest first)
+    result = cmp(tsB, tsA)
+  )
   
-  for line in cmdResult.output.splitLines():
-    # Skip empty lines or header lines
-    if line.len == 0 or line.startsWith("ID "):
-      continue
-      
-    let parts = line.splitWhitespace()
-    if parts.len >= 10:  # Make sure we have enough fields
-      let 
-        ctimeStr = parts[8]  # Creation time field
-        snapPath = parts[^1]  # Path is the last field
-        filename = snapPath.extractFilename()
-      
-      # Only consider snapshots with the right prefix and not the current one
-      if filename.startsWith(sourceBase) and filename != snapName:
-        try:
-          let ctime = parseBiggestInt(ctimeStr)
-          snapshotInfo.add((path: filename, ctime: ctime))
-        except ValueError:
-          # If we can't parse the timestamp, just skip this entry
-          continue
-  
-  # Sort by creation timestamp (newest first)
-  snapshotInfo.sort(proc(a, b: SnapInfo): int = cmp(b.ctime, a.ctime))
-  
-  # Return the most recent snapshot
-  if snapshotInfo.len > 0:
-    return some(snapshotInfo[0].path)
-  
-  return none(string)
+  echo &"Selected parent snapshot: {availableSnapshots[0]}"
+  return some(availableSnapshots[0])
 
 proc estimateDeltaSize(parentPath, currentPath: string): int =
   var dryRunCmd = newShellCommand()
