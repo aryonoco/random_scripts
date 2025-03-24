@@ -19,8 +19,6 @@ import {
 } from "jsr:@std/streams";
 import { FixedChunkStream } from "jsr:@std/streams/unstable-fixed-chunk-stream";
 
-import { parse } from "jsr:@std/csv";
-
 import { setup, getLogger, ConsoleHandler } from "jsr:@std/log";
 import type { LogRecord, LogConfig } from "jsr:@std/log";
 
