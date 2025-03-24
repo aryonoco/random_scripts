@@ -75,8 +75,8 @@ const LOG_CONFIG: LogConfig = {
       formatter: (logRecord: LogRecord) => {
         let message;
         try {
-          message = logRecord.args[0] === undefined
-            ? "undefined"
+          message = logRecord.args.length === 0
+            ? "[No message]"
             : typeof logRecord.args[0] === 'string'
               ? logRecord.args[0]
               : Deno.inspect(logRecord.args[0]);
