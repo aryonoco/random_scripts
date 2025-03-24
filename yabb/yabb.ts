@@ -4,7 +4,7 @@
 
 /// <reference lib="deno.ns" />
 import { retry } from "jsr:@std/async/retry";
-import { abortable, deadline } from "jsr:@std/async";
+import { deadline } from "jsr:@std/async";
 
 import { ensureFile, exists, expandGlob } from "jsr:@std/fs";
 
@@ -873,9 +873,10 @@ const getSnapName = (): string => {
 
 const removeSnapshot = async (
   basePath: string,
+  snapName: string,
   signal?: AbortSignal
 ): Promise<void> => {
-  const snapPath = path.join(basePath, getSnapName());
+  const snapPath = path.join(basePath, snapName);
   await executeCommand("btrfs", ["subvolume", "delete", snapPath], { signal });
 };
 
@@ -1416,25 +1417,18 @@ const cleanup = async (): Promise<void> => {
     if (state.snapshotCreated && !state.backupSuccessful && state.snapshotName) {
       userFeedback.info("Cleaning up failed backup artifacts", parseConfig());
       
-      // Delete source snapshot using stored name
-      const sourceSnapPath = path.join(config.snapDir, state.snapshotName);
-      if (await exists(sourceSnapPath)) {
-        await retryOperation(
-          (signal) => executeCommand("btrfs", ["subvolume", "delete", sourceSnapPath], { signal }),
-          3,
-          1000
-        );
-      }
-
-      // Delete destination snapshot if partially created
-      const destSnapPath = path.join(config.destMount, state.snapshotName);
-      if (await exists(destSnapPath)) {
-        await retryOperation(
-          (signal) => executeCommand("btrfs", ["subvolume", "delete", destSnapPath], { signal }),
-          3,
-          1000
-        );
-      }
+      // Use the improved removeSnapshot
+      await retryOperation(
+        (signal) => removeSnapshot(config.snapDir, state.snapshotName, signal), 
+        3, 
+        1000
+      );
+      
+      await retryOperation(
+        (signal) => removeSnapshot(config.destMount, state.snapshotName, signal),
+        3,
+        1000
+      );
     }
   } catch (error) {
     const formatter = new ErrorFormatter(parseConfig());
