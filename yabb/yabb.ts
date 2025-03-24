@@ -632,9 +632,18 @@ const executePipeline = async (
     // Add abortable writer
     const writer = Deno.stdout.writable.getWriter();
     const abortableWriter = new WritableStream({
-      write: (chunk) => writer.write(chunk),
-      close: () => writer.close(),
-      abort: (reason) => writer.abort(reason)
+      write(chunk) {
+        return writer.write(chunk);
+      },
+      // Don't close the underlying stdout resource
+      close() {
+        // Just release the writer without closing
+        writer.releaseLock();
+      },
+      abort(reason) {
+        writer.abort(reason);
+        writer.releaseLock();
+      }
     });
 
     // Execute pipeline
