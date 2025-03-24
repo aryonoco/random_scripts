@@ -1504,31 +1504,6 @@ const verifyDependencies = async (): Promise<void> => {
   }));
 };
 
-const parseTransactionIdFromPath = async (subvolPath: string): Promise<number> => {
-  const normalizedPath = path.normalize(subvolPath);
-  const showOutput = await executeCommand("btrfs", ["subvolume", "show", normalizedPath], { signal: abortController.signal });
-  const output = new TextDecoder().decode(showOutput.output);
-
-  try {
-    // Match exact Generation line from output
-    const generationMatch = output.match(/Generation:\s+(\d+)/);
-    if (!generationMatch) {
-      throw new BackupError("Generation number not found", "ETRANSID", {
-        context: {
-          outputSnippet: output.slice(0, 200),
-          suggestions: ["Verify btrfs subvolume show output format"]
-        }
-      });
-    }
-    return parseInt(generationMatch[1], 10);
-  } catch (error) {
-    throw new BackupError("Transaction ID parsing failed", "ETRANSID", {
-      cause: error,
-      context: { subvolPath }
-    });
-  }
-};
-
 const parseConfig = (): AppConfig => ({
   jsonOutput: Deno.args.includes("--json"),
   colorOutput: Deno.args.includes("--color") && Deno.stdout.isTerminal(),
