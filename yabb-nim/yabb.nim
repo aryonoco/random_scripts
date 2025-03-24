@@ -118,10 +118,30 @@ proc checkDestinationSpace(requiredBytes: int) =
   for line in output.splitLines:
     if line.contains("Free (estimated):"):
       try:
-        freeBytes = line.splitWhitespace()[^2].parseInt
-        foundFreeSpace = true
+        # The line format is: "Free (estimated):           12345678    (min: 12345678)"
+        # Get all space-separated items
+        let parts = line.splitWhitespace()
+        
+        # Find the actual bytes value (the number without parentheses)
+        for i in 0..<parts.len:
+          if parts[i] == "Free" and i+2 < parts.len:
+            try:
+              freeBytes = parseInt(parts[i+2])
+              foundFreeSpace = true
+              break
+            except:
+              continue
+        
+        if not foundFreeSpace and parts.len >= 3:
+          # Fallback: Try the third item which is often the value
+          try:
+            freeBytes = parseInt(parts[2])
+            foundFreeSpace = true
+          except:
+            discard
       except Exception as e:
-        logError(&"Could not parse free space value from btrfs output: {e.msg}")
+        # Log the raw line to help with debugging
+        logError(&"Could not parse free space from: '{line}'. Error: {e.msg}")
         # Program terminates here if parsing fails
       break
   
