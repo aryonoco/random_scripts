@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test --allow-read --allow-write --allow-env --allow-net=jsr.io --unstable
+#!/usr/bin/env -S deno run --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test --allow-read --allow-write --allow-env --allow-net=jsr.io --allow-sys --unstable-kv --unstable
 
 /// <reference lib="deno.ns" />
 import { delay } from "jsr:@std/async/delay";
@@ -71,9 +71,16 @@ const LOG_CONFIG: LogConfig = {
   handlers: {
     console: new ConsoleHandler("DEBUG", {
       formatter: (logRecord: LogRecord) => {
-        const message = typeof logRecord.args[0] === 'string' 
-          ? logRecord.args[0] 
-          : Deno.inspect(logRecord.args[0]);
+        let message;
+        try {
+          message = logRecord.args[0] === undefined
+            ? "undefined"
+            : typeof logRecord.args[0] === 'string'
+              ? logRecord.args[0]
+              : Deno.inspect(logRecord.args[0]);
+        } catch (_error) {
+          message = "Error formatting log message";
+        }
         return `${logRecord.datetime.toISOString()} [${logRecord.levelName}] ${message}`;
       },
       useColors: false,
@@ -1649,11 +1656,32 @@ const main = async () => {
 
 // Final verification of main error handler
 main().catch(error => {
-  const logger = getLogger();
-  const formatter = new ErrorFormatter(parseConfig());
-  const formattedError = error ? 
-    (error instanceof Error ? formatter.format(error) : `Non-Error: ${Deno.inspect(error)}`) : 
-    "Unknown error occurred";
-  logger.error(formattedError);
-  Deno.exit(1);
+  try {
+    const logger = getLogger();
+    let formattedError;
+    
+    try {
+      const formatter = new ErrorFormatter(parseConfig());
+      formattedError = error 
+        ? (error instanceof Error 
+            ? formatter.format(error) 
+            : `Non-Error: ${Deno.inspect(error)}`) 
+        : "Unknown error occurred";
+    } catch (formatError) {
+      // Fallback if formatter fails
+      formattedError = error instanceof Error 
+        ? `${error.name}: ${error.message}` 
+        : String(error || "Unknown error");
+      
+      console.error("Error while formatting error:", formatError);
+    }
+    
+    logger.error(formattedError);
+  } catch (loggerError) {
+    // Last resort if logger fails
+    console.error("Original error:", error);
+    console.error("Logger error:", loggerError);
+  } finally {
+    Deno.exit(1);
+  }
 });
