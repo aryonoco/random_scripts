@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2317
 exec deno run \
   --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test \
   --allow-read=/data,/mnt/external,/var/lock,/usr/bin,/etc/mtab \
