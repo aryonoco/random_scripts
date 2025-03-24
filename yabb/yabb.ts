@@ -440,7 +440,7 @@ const convertToBytes = (sizeStr: string): number => {
 };
 
 const sanitizeArgs = (args: string[]): string[] => 
-  args.map(arg => arg.replace(/[^a-zA-Z0-9_\/\-=.]/g, ""));
+  args.map(arg => arg.replace(/[^a-zA-Z0-9_\/\-=.:\s]/g, ""));
 
 // ==================== Command Execution ====================
 const ALLOWED_COMMANDS = new Set([
@@ -1273,11 +1273,11 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
   const config = parseConfig();
   userFeedback.progress(`Starting incremental backup from ${parentSnap}`, config);
 
-  // Use direct path construction without URL encoding
-  const parentPath = path.join(config.snapDir, parentSnap);
-  const destParentPath = path.join(config.destMount, parentSnap);
-
-  // Add explicit colon preservation
+  // Explicitly construct paths to preserve colons
+  const parentPath = `${config.snapDir}/${parentSnap}`;
+  const destParentPath = `${config.destMount}/${parentSnap}`;
+  
+  // Add explicit colon preservation verification
   const validatePathFormat = (p: string) => {
     if (!p.includes(':')) {
       throw new BackupError("Invalid snapshot path format", "EINVALID", {
