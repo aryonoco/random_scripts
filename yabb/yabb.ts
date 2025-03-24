@@ -1317,33 +1317,35 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
 const withLock = async <T>(
   fn: (file: Deno.FsFile) => Promise<T>
 ): Promise<T> => {
-  // Ensure lock file and directory exist with proper permissions
+  let file: Deno.FsFile | null = null;
+  
   try {
-    await ensureFile(config.lockFile);
-    await Deno.chmod(config.lockFile, config.lockFileMode);
-  } catch (error) {
-    throw new BackupError("Failed to initialize lock file", "ELOCK", {
-      cause: error,
-      context: {
-        path: config.lockFile,
-        mode: config.lockFileMode.toString(8),
-        suggestions: [
-          "Check directory permissions for: " + path.dirname(config.lockFile),
-          "Verify filesystem has enough inodes",
-          "Ensure parent directory exists"
-        ]
-      }
+    // Ensure lock file and directory exist with proper permissions
+    try {
+      await ensureFile(config.lockFile);
+      await Deno.chmod(config.lockFile, config.lockFileMode);
+    } catch (error) {
+      throw new BackupError("Failed to initialize lock file", "ELOCK", {
+        cause: error,
+        context: {
+          path: config.lockFile,
+          mode: config.lockFileMode.toString(8),
+          suggestions: [
+            "Check directory permissions for: " + path.dirname(config.lockFile),
+            "Verify filesystem has enough inodes",
+            "Ensure parent directory exists"
+          ]
+        }
+      });
+    }
+
+    file = await Deno.open(config.lockFile, {
+      create: false,
+      mode: config.lockFileMode,
+      read: true,
+      write: true,
     });
-  }
 
-  const file = await Deno.open(config.lockFile, {
-    create: false, // Now explicitly not creating since we ensured it exists
-    mode: config.lockFileMode,
-    read: true,
-    write: true,
-  });
-
-  try {
     // Create timeout signal and race against lock operation
     const timeoutSignal = AbortSignal.timeout(30_000);
     const lockPromise = file.lock(true); // Correct exclusive lock syntax
@@ -1380,9 +1382,15 @@ const withLock = async <T>(
     }
     throw error;
   } finally {
-    if (!abortController.signal.aborted) {
-      await file.unlock().catch(() => {});
-      file.close();
+    try {
+      if (file) {
+        await file.unlock().catch(() => {});
+        file.close();
+      }
+      // Always attempt to remove lock file
+      await Deno.remove(config.lockFile).catch(() => {});
+    } catch (_error) {
+      // Ignore any cleanup errors
     }
   }
 };
@@ -1390,40 +1398,35 @@ const withLock = async <T>(
 // ==================== Updated Cleanup Process ====================
 const cleanup = async (): Promise<void> => {
   const state = BackupState.getInstance();
-  const appConfig = parseConfig();
   
   try {
-    logger.info(`Cleanup state check: snapshotCreated=${state.snapshotCreated}, backupSuccessful=${state.backupSuccessful}, snapshotName=${state.snapshotName}`);
-
-    // Primary cleanup: Use state information to delete only the failed snapshot
+    console.warn("[Cleanup] Starting cleanup process...");
+    
     if (state.snapshotName && !state.backupSuccessful) {
-      userFeedback.warning("Cleaning up failed backup snapshot", appConfig);
+      console.warn(`[Cleanup] Removing failed snapshot: ${state.snapshotName}`);
       try {
         await removeSnapshot(config.snapDir, state.snapshotName);
         await removeSnapshot(config.destMount, state.snapshotName);
       } catch (error) {
-        userFeedback.error(`Failed to clean up snapshot ${state.snapshotName}: ${error}`, appConfig);
+        console.error(`[Cleanup Error] Failed to remove snapshot: ${error instanceof Error ? error.message : String(error)}`);
       }
-      return; // Exit after handling specific failed snapshot
+      return;
     }
 
-    // Fallback ONLY if state tracking completely failed
     if (!state.snapshotName && !state.backupSuccessful) {
-      userFeedback.warning("Performing emergency cleanup scan", appConfig);
+      console.warn("[Cleanup] Performing emergency cleanup scan");
       const newestSnapshot = await findNewestSnapshot();
       if (newestSnapshot) {
-        userFeedback.warning(`Attempting to clean up potential orphan: ${newestSnapshot}`, appConfig);
+        console.warn(`[Cleanup] Removing potential orphan: ${newestSnapshot}`);
         await removeSnapshot(config.snapDir, newestSnapshot);
         await removeSnapshot(config.destMount, newestSnapshot);
       }
     }
   } catch (error) {
-    const formatter = new ErrorFormatter(appConfig);
-    logger.error("Cleanup failed:\n" + formatter.format(error));
+    console.error("[Cleanup Critical Error]", error instanceof Error ? error.stack : String(error));
+  } finally {
+    console.log("[Cleanup] Cleanup process completed");
   }
-
-  // Lock file cleanup remains unchanged
-  // ...
 };
 
 // Helper function for fallback scenario
