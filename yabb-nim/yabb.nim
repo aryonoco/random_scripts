@@ -26,7 +26,7 @@ type
     commands: seq[seq[string]]  # Sequence of commands (each command is a sequence of arguments)
 
 const
-  config = Config(
+  config: Config = Config(
     sourceVol: "/data",
     snapDir: "/data/.snapshots",
     destMount: "/mnt/external",
@@ -39,25 +39,25 @@ var
   sourceBase: string
   snapName: string
   deltaSize: int
-  backupState = BackupState()
-  lockFileCreated = false
+  backupState: BackupState = BackupState()
+  lockFileCreated: bool = false
 
 proc logError(msg: string) {.raises: [IOError, Exception].} =
-  let timestamp = now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+  let timestamp: string = now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
   stderr.writeLine(&"[{timestamp}] ERROR: {msg}")
   raise newException(Exception, msg)
 
 proc formatBytes(bytes: int): string =
-  const units = ["B", "KB", "MB", "GB", "TB"]
+  const units: array[0..4, string] = ["B", "KB", "MB", "GB", "TB"]
   var 
-    value = bytes.float
-    unitIdx = 0
+    value: float = bytes.float
+    unitIdx: int = 0
   
   while value >= 1024 and unitIdx < units.high:
     value /= 1024
     unitIdx.inc
   
-  let rounded = round(value * 10) / 10
+  let rounded: float = round(value * 10) / 10
   &"{rounded.formatFloat(ffDecimal, precision=1)} {units[unitIdx]}"
 
 proc newShellCommand(): ShellCommand =
@@ -83,7 +83,7 @@ proc quoteForShell(s: string): string =
   return "'" & s.replace("'", "'\\''") & "'"
 
 proc toString(cmd: ShellCommand): string =
-  var resultCmd = ""
+  var resultCmd: string = ""
   for i, command in cmd.commands:
     if i > 0:
       resultCmd.add(" | ")
@@ -95,32 +95,32 @@ proc execShellCmd(cmd: ShellCommand, options: set[ProcessOption] = {poUsePath, p
   execCmdEx(cmd.toString(), options = options)
 
 proc checkDestinationSpace(requiredBytes: int) =
-  let buffer = 1_000_000_000  # 1GB buffer
-  let requiredWithBuffer = requiredBytes + buffer
+  let buffer: int = 1_000_000_000  # 1GB buffer
+  let requiredWithBuffer: int = requiredBytes + buffer
   
-  var cmd = newShellCommand()
+  var cmd: ShellCommand = newShellCommand()
   cmd.addArg("btrfs")
   cmd.addArg("filesystem")
   cmd.addArg("usage")
   cmd.addArg("-b")
   cmd.addArg(config.destMount)
   
-  let result = execShellCmd(cmd)
+  let result: tuple[output: string, exitCode: int] = execShellCmd(cmd)
   
   if result.exitCode != 0:
     logError("Failed to check destination filesystem")
     # Program terminates here if error occurs
   
-  let output = result.output
+  let output: string = result.output
   var freeBytes: int = 0
-  var foundFreeSpace = false
+  var foundFreeSpace: bool = false
   
   for line in output.splitLines:
     if line.contains("Free (estimated):"):
       try:
         # The line format is: "Free (estimated):           12345678    (min: 12345678)"
         # Get all space-separated items
-        let parts = line.splitWhitespace()
+        let parts: seq[string] = line.splitWhitespace()
         
         # Find the actual bytes value (the number without parentheses)
         for i in 0..<parts.len:
@@ -160,45 +160,45 @@ proc checkDestinationSpace(requiredBytes: int) =
   echo "Space check passed - sufficient free space available"
 
 proc verifyUuids(sourcePath, destPath: string): bool =
-  var sourceCmd = newShellCommand()
+  var sourceCmd: ShellCommand = newShellCommand()
   sourceCmd.addArg("btrfs")
   sourceCmd.addArg("subvolume")
   sourceCmd.addArg("show")
   sourceCmd.addArg(sourcePath)
   
-  var destCmd = newShellCommand()
+  var destCmd: ShellCommand = newShellCommand()
   destCmd.addArg("btrfs")
   destCmd.addArg("subvolume")
   destCmd.addArg("show")
   destCmd.addArg(destPath)
 
   let 
-    sourceResult = execShellCmd(sourceCmd)
-    destResult = execShellCmd(destCmd)
+    sourceResult: tuple[output: string, exitCode: int] = execShellCmd(sourceCmd)
+    destResult: tuple[output: string, exitCode: int] = execShellCmd(destCmd)
 
   if sourceResult.exitCode != 0 or destResult.exitCode != 0:
     return false
 
   var sourceUuid, destUuid: string
   
-  let sourceLines = sourceResult.output.splitLines.filterIt(it.contains("UUID:"))
+  let sourceLines: seq[string] = sourceResult.output.splitLines.filterIt(it.contains("UUID:"))
   if sourceLines.len > 0:
     sourceUuid = sourceLines[0].splitWhitespace()[^1]
   
-  let destReceivedLines = destResult.output.splitLines.filterIt(it.contains("Received UUID:"))
+  let destReceivedLines: seq[string] = destResult.output.splitLines.filterIt(it.contains("Received UUID:"))
   if destReceivedLines.len > 0:
     destUuid = destReceivedLines[0].splitWhitespace()[^1]
   else:
-    let destRegularLines = destResult.output.splitLines.filterIt(it.contains("UUID:"))
+    let destRegularLines: seq[string] = destResult.output.splitLines.filterIt(it.contains("UUID:"))
     if destRegularLines.len > 0:
       destUuid = destRegularLines[0].splitWhitespace()[^1]
 
   return sourceUuid == destUuid
 
 proc checkDependencies() =
-  let deps = ["btrfs", "pv"]
+  let deps: array[0..1, string] = ["btrfs", "pv"]
   for dep in deps:
-    var cmd = newShellCommand()
+    var cmd: ShellCommand = newShellCommand()
     cmd.addArg("command")
     cmd.addArg("-v")
     cmd.addArg(dep)
@@ -209,13 +209,13 @@ proc checkMount(mountPath: string) =
   if not dirExists(mountPath):
     logError(&"Mount point {mountPath} does not exist")
   
-  var mountpointCmd = newShellCommand()
+  var mountpointCmd: ShellCommand = newShellCommand()
   mountpointCmd.addArg("mountpoint")
   mountpointCmd.addArg("-q")
   mountpointCmd.addArg(mountPath)
   
   if execShellCmd(mountpointCmd).exitCode != 0:
-    var mountCmd = newShellCommand()
+    var mountCmd: ShellCommand = newShellCommand()
     mountCmd.addArg("mount")
     mountCmd.addArg(mountPath)
     
@@ -228,18 +228,18 @@ proc acquireLock() =
     originalUmask = umask(0o177)  # Set restrictive permissions
     
     # Attempt to create the lock file with O_CREAT|O_EXCL for atomic creation
-    let fd = posix.open(cstring(config.lockFile), O_CREAT or O_EXCL or O_WRONLY, 0o600)
+    let fd: cint = posix.open(cstring(config.lockFile), O_CREAT or O_EXCL or O_WRONLY, 0o600)
     if fd == -1:
-      let errCode = osLastError()
+      let errCode: OSErrorCode = osLastError()
       if errCode == OSErrorCode(EEXIST):
         # File exists, check if process is still running
         try:
-          var existingLockFile = open(config.lockFile, fmRead)
+          var existingLockFile: File = open(config.lockFile, fmRead)
           defer: existingLockFile.close()
           
-          let pidStr = existingLockFile.readLine()
+          let pidStr: string = existingLockFile.readLine()
           try:
-            let pid = parseInt(pidStr)
+            let pid: int = parseInt(pidStr)
             
             # Check if process is still running using kill with signal 0
             # (doesn't actually send a signal but checks if process exists)
@@ -268,7 +268,7 @@ proc acquireLock() =
     
     try:
       # Create a separate Nim file object for the already opened fd
-      var pidFile = open(config.lockFile, fmWrite)
+      var pidFile: File = open(config.lockFile, fmWrite)
       defer: pidFile.close()
       
       # Write PID to lockfile
@@ -282,7 +282,7 @@ proc acquireLock() =
       fl.l_start = 0
       fl.l_len = 0
       
-      let rc = fcntl(fd, F_SETLK, addr fl)
+      let rc: cint = fcntl(fd, F_SETLK, addr fl)
       if rc == -1:
         removeFile(config.lockFile)
         logError("Failed to acquire lock (fcntl error)")
@@ -351,18 +351,18 @@ proc estimateDeltaSize(parentPath, currentPath: string): int =
   dryRunCmd.addArg("wc")
   dryRunCmd.addArg("-c")
   
-  let dryRun = execShellCmd(dryRunCmd)
+  let dryRun: tuple[output: string, exitCode: int] = execShellCmd(dryRunCmd)
   
-  var estimated = if dryRun.exitCode == 0:
-    let bytes = dryRun.output.strip.parseInt
+  var estimated: int = if dryRun.exitCode == 0:
+    let bytes: int = dryRun.output.strip.parseInt
     bytes + bytes div 20
   else:
-    var duCmd = newShellCommand()
+    var duCmd: ShellCommand = newShellCommand()
     duCmd.addArg("du")
     duCmd.addArg("-sb")
     duCmd.addArg(currentPath)
     
-    let duOutput = execShellCmd(duCmd).output.splitWhitespace()[0]
+    let duOutput: string = execShellCmd(duCmd).output.splitWhitespace()[0]
     duOutput.parseInt div 10
 
   # Enforce 10MB minimum
@@ -371,7 +371,7 @@ proc estimateDeltaSize(parentPath, currentPath: string): int =
 
 proc runPipelineWithStatusCheck(cmdPipeline: ShellCommand): tuple[output: string, statuses: seq[int]] =
   # Create a bash script that will execute our command and capture PIPESTATUS properly
-  let bashScript = """
+  let bashScript: string = """
 #!/usr/bin/env bash
 set -o pipefail
 # Run the command and capture its output
@@ -393,8 +393,8 @@ exit $RESULT
 """
 
   # Create a secure temporary file using mkstemp
-  var tmpFilename = getTempDir() / "yabb_XXXXXX"
-  var fd = posix.mkstemp(cstring(tmpFilename))
+  var tmpFilename: string = getTempDir() / "yabb_XXXXXX"
+  var fd: cint = posix.mkstemp(cstring(tmpFilename))
   if fd == -1:
     raise newException(IOError, "Failed to create secure temporary file: " & $strerror(errno))
   
@@ -411,15 +411,15 @@ exit $RESULT
     discard chmod(cstring(tmpFilename), 0o700)  # rwx for user only
     
     # Run the script
-    var scriptCmd = newShellCommand()
+    var scriptCmd: ShellCommand = newShellCommand()
     scriptCmd.addArg(tmpFilename)
-    let scriptResult = execShellCmd(scriptCmd)
+    let scriptResult: tuple[output: string, exitCode: int] = execShellCmd(scriptCmd)
     
     # Parse the output
     var 
-      output = ""
+      output: string = ""
       statuses: seq[int] = @[]
-      inPipestatus = false
+      inPipestatus: bool = false
       
     for line in scriptResult.output.splitLines():
       if line == "---COMMAND_OUTPUT_END---":
@@ -456,19 +456,19 @@ exit $RESULT
       echo "Warning: Could not remove temporary file: " & tmpFilename
 
 proc performBackup(parentSnapshot: Option[string]) =
-  let pvArgs = if config.showProgressPercent: "-petab" else: "-b"
-  var cmdPipeline = newShellCommand()
-  var backupType = "full"
+  let pvArgs: string = if config.showProgressPercent: "-petab" else: "-b"
+  var cmdPipeline: ShellCommand = newShellCommand()
+  var backupType: string = "full"
   
   if parentSnapshot.isSome:
     backupType = "incremental"
-    let parent = parentSnapshot.get
+    let parent: string = parentSnapshot.get
     
-    let destParentPath = config.destMount / parent
+    let destParentPath: string = config.destMount / parent
     if not dirExists(destParentPath):
       logError(&"Parent snapshot {parent} missing from destination")
     
-    let sourceParentPath = config.snapDir / parent
+    let sourceParentPath: string = config.snapDir / parent
     if not verifyUuids(sourceParentPath, destParentPath):
       logError("Parent snapshot UUID mismatch")
     
@@ -496,12 +496,12 @@ proc performBackup(parentSnapshot: Option[string]) =
     
   else:
     # Calculate size for full backup
-    var sizeCmd = newShellCommand()
+    var sizeCmd: ShellCommand = newShellCommand()
     sizeCmd.addArg("du")
     sizeCmd.addArg("-sb")
     sizeCmd.addArg(config.snapDir / snapName)
     
-    let sizeResult = execShellCmd(sizeCmd)
+    let sizeResult: tuple[output: string, exitCode: int] = execShellCmd(sizeCmd)
     if sizeResult.exitCode != 0:
       logError("Failed to calculate backup size")
     
@@ -528,9 +528,9 @@ proc performBackup(parentSnapshot: Option[string]) =
   echo &"Starting {backupType} send with progress monitoring"
   
   # Run with status checking
-  let result = runPipelineWithStatusCheck(cmdPipeline)
-  var pipelineSuccess = true
-  var errorMsg = ""
+  let result: tuple[output: string, statuses: seq[int]] = runPipelineWithStatusCheck(cmdPipeline)
+  var pipelineSuccess: bool = true
+  var errorMsg: string = ""
   
   # Check each pipeline component's status
   if result.statuses.len >= 3:
@@ -567,9 +567,9 @@ proc performBackup(parentSnapshot: Option[string]) =
 proc cleanup() =
   if backupState.snapshotCreated and not backupState.backupSuccessful:
     proc deleteWithRetries(thePath: string) {.raises: [OSError, IOError].} =
-      var retries = 3
+      var retries: int = 3
       while retries > 0:
-        var delCmd = newShellCommand()
+        var delCmd: ShellCommand = newShellCommand()
         delCmd.addArg("btrfs")
         delCmd.addArg("subvolume")
         delCmd.addArg("delete")
@@ -590,7 +590,7 @@ proc quoteIfNeeded(s: string): string =
   return s
 
 when isMainModule:
-  var exitCode = 0
+  var exitCode: int = 0
   
   try:
     # Add proper configuration for the file logger
@@ -615,7 +615,7 @@ when isMainModule:
     checkMount(config.destMount)
     acquireLock()
     
-    var snapCmd = newShellCommand()
+    var snapCmd: ShellCommand = newShellCommand()
     snapCmd.addArg("btrfs")
     snapCmd.addArg("subvolume")
     snapCmd.addArg("snapshot")
@@ -623,16 +623,16 @@ when isMainModule:
     snapCmd.addArg(config.sourceVol)
     snapCmd.addArg(config.snapDir / snapName)
     
-    let snapResult = execShellCmd(snapCmd)
+    let snapResult: tuple[output: string, exitCode: int] = execShellCmd(snapCmd)
     if snapResult.exitCode != 0:
       logError("Failed to create snapshot")
     backupState.snapshotCreated = true
     
-    let parentSnapshot = findParentSnapshot()
+    let parentSnapshot: Option[system.string] = findParentSnapshot()
     performBackup(parentSnapshot)
     
-    let sourceSnapPath = config.snapDir / snapName
-    let destSnapPath = config.destMount / snapName
+    let sourceSnapPath: string = config.snapDir / snapName
+    let destSnapPath: string = config.destMount / snapName
     
     if not verifyUuids(sourceSnapPath, destSnapPath):
       backupState.backupSuccessful = false  # Mark as failed
@@ -641,7 +641,7 @@ when isMainModule:
     # This is now the only place where we set backupState.backupSuccessful = true
     # It will only be reached if both the backup pipeline and UUID verification succeeded
     backupState.backupSuccessful = true
-    let backupType = if parentSnapshot.isSome: "incremental" else: "full"
+    let backupType: string = if parentSnapshot.isSome: "incremental" else: "full"
     echo &"Backup successful: {quoteIfNeeded(snapName)} ({backupType})!"
     
   except IOError as e:
@@ -663,7 +663,7 @@ when isMainModule:
   except Exception as e:
     # Handle any other exceptions
     exitCode = 1
-    let msg = e.msg
+    let msg: string = e.msg
     try:
       stderr.writeLine(&"ERROR: {msg}")
     except IOError:
