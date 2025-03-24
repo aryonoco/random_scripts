@@ -1,5 +1,5 @@
 #!/bin/sh
-# shellcheck disable=SC2317
+':' //
 exec deno run \
   --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test \
   --allow-read=/data,/mnt/external,/var/lock,/usr/bin,/etc/mtab \
@@ -10,7 +10,7 @@ exec deno run \
   --unstable-kv \
   --v8-flags="--max-old-space-size=256,--jitless,--optimize-for-size,--use-ic,--no-concurrent-recompilation,--enable-ssse3,--enable-sse4-1,--enable-sse4-2" \
   --no-check "$0" "$@"
-exit 0
+exit $?
 
 /// <reference lib="deno.ns" />
 import { delay } from "jsr:@std/async/delay";
