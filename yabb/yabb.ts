@@ -527,22 +527,6 @@ const executeCommand = async (
   }
 };
 
-// ==================== Updated Output Filtering ====================
-const createOutputFilter = () => {
-  const filterPattern = /write\s+.*\soffset=/;
-  
-  return new TransformStream<string, string>({
-    transform(line, controller) {
-      if (!filterPattern.test(line)) {
-        controller.enqueue(line);
-      }
-    },
-    flush(controller) {
-      controller.terminate();
-    }
-  });
-};
-
 // ==================== New Progress Types ====================
 interface ProgressStats {
   bytesTransferred: number;
@@ -581,8 +565,8 @@ const executePipeline = async (
       ],
       stdin: "piped",
       stdout: "piped",
-      stderr: isBtrfsSend ? "piped" : isBtrfsReceive ? "piped" : "inherit",
-      signal: abortController.signal // Propagate abort signal
+      stderr: "piped", // Always pipe stderr for all processes
+      signal: abortController.signal
     }).spawn();
 
     return {
@@ -601,7 +585,7 @@ const executePipeline = async (
   });
 
   try {
-    // Connect pipeline using ReadableStream composition
+    // Connect pipeline using ReadableStream composition for stdout
     const pipeline = processes.reduce((prev, { wrappedStreams }) => 
       prev.pipeThrough({
         readable: wrappedStreams.stdout,
@@ -618,16 +602,32 @@ const executePipeline = async (
 
     // Collect error streams using ReadableStream
     const stderrPromises = processes.map(async ({ wrappedStreams }) => {
-      if (!wrappedStreams.stderr) return "";
-      return await toText(wrappedStreams.stderr);
+      try {
+        return await toText(wrappedStreams.stderr);
+      } catch (_error) {
+        return ""; // Return empty string if stderr isn't available
+      }
     });
 
-    const [statuses, stderrs] = await Promise.all([
-      Promise.all(processes.map(p => 
-        deadline(p.wrappedStreams.status, 300_000) // 5m timeout
-      )),
-      Promise.all(stderrPromises)
-    ]);
+    // Combined stderr handling like the shell script
+    const stderrStreams = processes.map(p => p.wrappedStreams.stderr);
+    const combinedStderr = mergeReadableStreams(...stderrStreams)
+      .pipeThrough(new TextDecoderStream())
+      .pipeThrough(new TextLineStream())
+      .pipeThrough(new TransformStream<string, string>({
+        transform(line, controller) {
+          // Filter out "write ... offset=" lines like the shell script does
+          if (!line.match(/write\s+.*\soffset=/)) {
+            controller.enqueue(line + "\n");
+          }
+        }
+      }))
+      .pipeThrough(new TextEncoderStream());
+
+    // Pipe combined stderr to stderr
+    combinedStderr.pipeTo(Deno.stderr.writable).catch(() => {
+      /* Ignore stderr pipe errors */
+    });
 
     // Add abortable writer
     const writer = Deno.stdout.writable.getWriter();
@@ -637,49 +637,28 @@ const executePipeline = async (
       abort: (reason) => writer.abort(reason)
     });
 
+    // Execute pipeline
     await pipeline.pipeTo(abortableWriter, { 
       signal: abortController.signal 
     });
 
-    // Setup progress monitoring and filtering
-    const receiveProcess = processes.find(p => p.isBtrfsReceive);
-    if (receiveProcess) {
-      const filteredStream = receiveProcess.wrappedStreams.stderr
-        .pipeThrough(new TextDecoderStream())
-        .pipeThrough(new TextLineStream({ allowCR: true }))
-        .pipeThrough(createOutputFilter())
-        .pipeThrough(new TextEncoderStream());
-
-      const rawStream = receiveProcess.wrappedStreams.stderr;
-      
-      await mergeReadableStreams(rawStream, filteredStream)
-        .pipeTo(Deno.stderr.writable)
-        .catch(error => {
-          throw new PipelineError("Output filtering failed", {
-            commands,
-            statuses,
-            stderrs,
-            cause: error,
-            suggestions: [
-              "Verify source data integrity with 'btrfs scrub'",
-              "Check storage device health",
-              "Retry the operation"
-            ]
-          });
-        });
-    }
-
     // Check command statuses after pipeline completes
+    const statuses = await Promise.all(processes.map(p => 
+      deadline(p.wrappedStreams.status, 300_000) // 5m timeout
+    ));
+    
+    const stderrs = await Promise.all(stderrPromises);
+
     const failedCommands = statuses
-      .map((status: Deno.CommandStatus | undefined, index: number) => ({ status, command: commands[index] }))
-      .filter(({ status }: { status?: Deno.CommandStatus }) => !status?.success);
+      .map((status, index) => ({ status, command: commands[index] }))
+      .filter(({ status }) => !status.success);
 
     if (failedCommands.length > 0) {
       throw new PipelineError("Pipeline command failed", {
         commands,
         statuses,
         stderrs,
-        cause: failedCommands[0].status?.code,
+        cause: failedCommands[0].status.code,
         suggestions: [
           "Verify source data integrity with 'btrfs scrub'",
           "Check storage device health",
@@ -689,17 +668,32 @@ const executePipeline = async (
     }
 
   } catch (error) {
+    // Handle errors similarly to before
     if (error instanceof BackupError) throw error;
     
-    // Handle partial results if available
-    const partialStatuses = await Promise.all(processes.map(p => p.wrappedStreams.status.catch(() => undefined)));
-    const partialStderrs = await Promise.all(processes.map(async (p) => {
-      if (!p.wrappedStreams.stderr) return "";
-      return await toText(p.wrappedStreams.stderr);
-    }));
+    // Get as many statuses as possible
+    const partialStatuses = await Promise.all(
+      processes.map(p => p.wrappedStreams.status.catch(() => undefined))
+    );
+    
+    // Get as many stderrs as possible
+    const partialStderrs = await Promise.all(
+      processes.map(async (p) => {
+        try {
+          return await toText(p.wrappedStreams.stderr);
+        } catch (_error) {
+          return "";
+        }
+      })
+    );
 
-    if (error instanceof Deno.errors.Interrupted) {
-      throw new PipelineError("Pipeline interrupted mid-execution", {
+    // Create appropriate error based on type
+    throw new PipelineError(
+      error instanceof Deno.errors.Interrupted ? "Pipeline interrupted mid-execution" :
+      error instanceof Deno.errors.UnexpectedEof ? "Unexpected end of data stream" :
+      error instanceof Deno.errors.WriteZero ? "Data write failure - zero bytes written" :
+      "Pipeline execution failed", 
+      {
         commands,
         statuses: partialStatuses,
         stderrs: partialStderrs,
@@ -709,48 +703,8 @@ const executePipeline = async (
           "Check storage device health",
           "Retry the operation"
         ]
-      });
-    }
-
-    if (error instanceof Deno.errors.UnexpectedEof) {
-      throw new PipelineError("Unexpected end of data stream", {
-        commands,
-        statuses: partialStatuses,
-        stderrs: partialStderrs,
-        cause: error,
-        suggestions: [
-          "Verify source data integrity with 'btrfs scrub'",
-          "Check storage device health",
-          "Retry the operation"
-        ]
-      });
-    }
-
-    if (error instanceof Deno.errors.WriteZero) {
-      throw new PipelineError("Data write failure - zero bytes written", {
-        commands,
-        statuses: partialStatuses,
-        stderrs: partialStderrs,
-        cause: error,
-        suggestions: [
-          "Check destination storage device health",
-          "Verify available disk space",
-          "Test storage media with badblocks"
-        ]
-      });
-    }
-
-    throw new PipelineError("Pipeline execution failed", {
-      commands,
-      statuses: partialStatuses,
-      stderrs: partialStderrs,
-      cause: error,
-      suggestions: [
-        "Verify source data integrity with 'btrfs scrub'",
-        "Check storage device health",
-        "Retry the operation"
-      ]
-    });
+      }
+    );
   } finally {
     if(abortController.signal.aborted) {
       processes.forEach(p => {
