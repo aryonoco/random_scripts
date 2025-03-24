@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test --allow-read --allow-write --allow-env --allow-net=jsr.io --allow-sys --unstable-kv --unstable
+#!/usr/bin/env -S deno run --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test --allow-read=/data,/mnt/external,/var/lock,/usr/bin,/etc/mtab --allow-write=/data/.snapshots,/mnt/external,/var/lock --allow-env=TZ --allow-net=jsr.io --allow-sys --unstable-kv --unstable-fs-events --v8-flags="--max-old-space-size=256,--jitless,--optimize-for-size,--use-ic,--no-concurrent-recompilation,--enable-ssse3,--enable-sse4-1,--enable-sse4-2" --no-check
 
 /// <reference lib="deno.ns" />
 import { delay } from "jsr:@std/async/delay";
@@ -1521,14 +1521,29 @@ const parseTransactionIdFromPath = async (subvolPath: string): Promise<number> =
   }
 };
 
-const parseConfig = (): AppConfig => ({
-  jsonOutput: Deno.args.includes("--json"),
-  colorOutput: Deno.args.includes("--color") && Deno.stdout.isTerminal(),
-  showProgress: Deno.stdout.isTerminal() && !Deno.args.includes("--no-progress"),
-  destMount: path.normalize(config.destMount),
-  snapDir: path.normalize(config.snapDir),
-  sourceVol: path.normalize(config.sourceVol)
-});
+const parseConfig = (): AppConfig => {
+  try {
+    return {
+      jsonOutput: Deno.args.includes("--json"),
+      colorOutput: Deno.args.includes("--color") && Deno.stdout.isTerminal(),
+      showProgress: Deno.stdout.isTerminal() && !Deno.args.includes("--no-progress"),
+      destMount: path.normalize(config.destMount),
+      snapDir: path.normalize(config.snapDir),
+      sourceVol: path.normalize(config.sourceVol)
+    };
+  } catch (error) {
+    console.error("Failed to parse config:", error);
+    // Return default configuration as fallback
+    return {
+      jsonOutput: false,
+      colorOutput: false,
+      showProgress: false,
+      destMount: config.destMount,
+      snapDir: config.snapDir,
+      sourceVol: config.sourceVol
+    };
+  }
+};
 
 const extractUuidFromOutput = (output: Uint8Array): string | null => {
   const text = new TextDecoder().decode(output);
@@ -1656,31 +1671,32 @@ const main = async () => {
 
 // Final verification of main error handler
 main().catch(error => {
+  console.error("Error in main:", error);
+  
   try {
+    // Try to use setup logger if available
     const logger = getLogger();
-    let formattedError;
     
+    // Simple message as fallback
+    const simpleMessage = error instanceof Error 
+      ? `${error.name}: ${error.message}`
+      : String(error || "Unknown error");
+    
+    logger.error(simpleMessage);
+    
+    // Try formatter if available, but don't throw if it fails
     try {
       const formatter = new ErrorFormatter(parseConfig());
-      formattedError = error 
-        ? (error instanceof Error 
-            ? formatter.format(error) 
-            : `Non-Error: ${Deno.inspect(error)}`) 
-        : "Unknown error occurred";
-    } catch (formatError) {
-      // Fallback if formatter fails
-      formattedError = error instanceof Error 
-        ? `${error.name}: ${error.message}` 
-        : String(error || "Unknown error");
-      
-      console.error("Error while formatting error:", formatError);
+      const formattedError = formatter.format(error);
+      if (formattedError && formattedError !== "undefined") {
+        logger.error(formattedError);
+      }
+    } catch (_formatError) {
+      // Already logged simple message, so we can ignore this
     }
-    
-    logger.error(formattedError);
-  } catch (loggerError) {
-    // Last resort if logger fails
-    console.error("Original error:", error);
-    console.error("Logger error:", loggerError);
+  } catch (_loggerError) {
+    // If logger fails, use console directly
+    console.error("Failed to log error through logger. Original error:", error);
   } finally {
     Deno.exit(1);
   }
