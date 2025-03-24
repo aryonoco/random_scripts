@@ -833,15 +833,6 @@ const getSnapName = (): string => {
     `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())}Z`;
 };
 
-const removeSnapshot = async (
-  basePath: string,
-  snapName: string,
-  signal?: AbortSignal
-): Promise<void> => {
-  const snapPath = path.join(basePath, snapName);
-  await executeCommand("btrfs", ["subvolume", "delete", snapPath], { signal });
-};
-
 const estimateDeltaSize = async (
   parentPath: string,
   currentPath: string
@@ -1403,51 +1394,123 @@ const cleanup = async (): Promise<void> => {
     console.warn("[Cleanup] Starting cleanup process...");
     
     if (state.snapshotName && !state.backupSuccessful) {
-      console.warn(`[Cleanup] Removing failed snapshot: ${state.snapshotName}`);
+      console.warn(`[Cleanup] Failed backup detected: ${state.snapshotName}`);
       
-      // Check if source snapshot exists before attempting removal
-      const sourceSnapPath = path.join(config.snapDir, state.snapshotName);
-      if (await exists(sourceSnapPath)) {
-        try {
+      try {
+        // Check and clean up source snapshot with separate error handling
+        const sourceSnapPath = path.join(config.snapDir, state.snapshotName);
+        console.warn(`[Cleanup] Checking source snapshot: ${sourceSnapPath}`);
+        const sourceExists = await exists(sourceSnapPath).catch(() => false);
+        
+        if (sourceExists) {
           console.warn(`[Cleanup] Removing source snapshot: ${sourceSnapPath}`);
-          await removeSnapshot(config.snapDir, state.snapshotName);
-        } catch (error) {
-          console.error(`[Cleanup Error] Failed to remove source snapshot: ${error instanceof Error ? error.message : String(error)}`);
+          try {
+            const result = await executeCommand("btrfs", ["subvolume", "delete", sourceSnapPath], {})
+              .catch(e => {
+                console.error(`[Cleanup] Execute error: ${e instanceof Error ? e.message : String(e)}`);
+                return { success: false, output: new Uint8Array() };
+              });
+            console.warn(`[Cleanup] Source removal ${result.success ? 'succeeded' : 'failed'}`);
+          } catch (error) {
+            console.error(`[Cleanup] Source removal error caught: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        } else {
+          console.warn(`[Cleanup] Source snapshot doesn't exist: ${sourceSnapPath}`);
         }
+      } catch (sourceError) {
+        console.error(`[Cleanup] Source error: ${sourceError instanceof Error ? sourceError.message : String(sourceError)}`);
       }
       
-      // Check if destination snapshot exists before attempting removal
-      const destSnapPath = path.join(config.destMount, state.snapshotName);
-      if (await exists(destSnapPath)) {
-        try {
+      try {
+        // Check and clean up destination snapshot with completely separate error handling
+        const destSnapPath = path.join(config.destMount, state.snapshotName);
+        console.warn(`[Cleanup] Checking destination snapshot: ${destSnapPath}`);
+        const destExists = await exists(destSnapPath).catch(() => false);
+        
+        if (destExists) {
           console.warn(`[Cleanup] Removing destination snapshot: ${destSnapPath}`);
-          await removeSnapshot(config.destMount, state.snapshotName);
-        } catch (error) {
-          console.error(`[Cleanup Error] Failed to remove destination snapshot: ${error instanceof Error ? error.message : String(error)}`);
+          try {
+            const result = await executeCommand("btrfs", ["subvolume", "delete", destSnapPath], {})
+              .catch(e => {
+                console.error(`[Cleanup] Execute error: ${e instanceof Error ? e.message : String(e)}`);
+                return { success: false, output: new Uint8Array() };
+              });
+            console.warn(`[Cleanup] Destination removal ${result.success ? 'succeeded' : 'failed'}`);
+          } catch (error) {
+            console.error(`[Cleanup] Destination removal error caught: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        } else {
+          console.warn(`[Cleanup] Destination snapshot doesn't exist: ${destSnapPath}`);
         }
-      } else {
-        console.warn(`[Cleanup] Destination snapshot doesn't exist: ${destSnapPath}`);
+      } catch (destError) {
+        console.error(`[Cleanup] Destination error: ${destError instanceof Error ? destError.message : String(destError)}`);
       }
       
       return;
     }
 
+    // Complete the emergency cleanup case with the same robust approach
     if (!state.snapshotName && !state.backupSuccessful) {
       console.warn("[Cleanup] Performing emergency cleanup scan");
-      const newestSnapshot = await findNewestSnapshot();
-      if (newestSnapshot) {
-        console.warn(`[Cleanup] Removing potential orphan: ${newestSnapshot}`);
-        
-        // Apply the same existence check pattern for emergency cleanup
-        const sourceSnapPath = path.join(config.snapDir, newestSnapshot);
-        if (await exists(sourceSnapPath)) {
-          await removeSnapshot(config.snapDir, newestSnapshot);
+      try {
+        const newestSnapshot = await findNewestSnapshot();
+        if (newestSnapshot) {
+          console.warn(`[Cleanup] Found potential orphan: ${newestSnapshot}`);
+          
+          // Source cleanup
+          try {
+            const sourceSnapPath = path.join(config.snapDir, newestSnapshot);
+            console.warn(`[Cleanup] Checking source snapshot: ${sourceSnapPath}`);
+            const sourceExists = await exists(sourceSnapPath).catch(() => false);
+            
+            if (sourceExists) {
+              console.warn(`[Cleanup] Removing orphaned source snapshot: ${sourceSnapPath}`);
+              try {
+                const result = await executeCommand("btrfs", ["subvolume", "delete", sourceSnapPath], {})
+                  .catch(e => {
+                    console.error(`[Cleanup] Execute error: ${e instanceof Error ? e.message : String(e)}`);
+                    return { success: false, output: new Uint8Array() };
+                  });
+                console.warn(`[Cleanup] Orphan source removal ${result.success ? 'succeeded' : 'failed'}`);
+              } catch (error) {
+                console.error(`[Cleanup] Orphan source removal error: ${error instanceof Error ? error.message : String(error)}`);
+              }
+            } else {
+              console.warn(`[Cleanup] Orphaned source snapshot doesn't exist: ${sourceSnapPath}`);
+            }
+          } catch (sourceError) {
+            console.error(`[Cleanup] Orphan source error: ${sourceError instanceof Error ? sourceError.message : String(sourceError)}`);
+          }
+          
+          // Destination cleanup
+          try {
+            const destSnapPath = path.join(config.destMount, newestSnapshot);
+            console.warn(`[Cleanup] Checking destination snapshot: ${destSnapPath}`);
+            const destExists = await exists(destSnapPath).catch(() => false);
+            
+            if (destExists) {
+              console.warn(`[Cleanup] Removing orphaned destination snapshot: ${destSnapPath}`);
+              try {
+                const result = await executeCommand("btrfs", ["subvolume", "delete", destSnapPath], {})
+                  .catch(e => {
+                    console.error(`[Cleanup] Execute error: ${e instanceof Error ? e.message : String(e)}`);
+                    return { success: false, output: new Uint8Array() };
+                  });
+                console.warn(`[Cleanup] Orphan destination removal ${result.success ? 'succeeded' : 'failed'}`);
+              } catch (error) {
+                console.error(`[Cleanup] Orphan destination removal error: ${error instanceof Error ? error.message : String(error)}`);
+              }
+            } else {
+              console.warn(`[Cleanup] Orphaned destination snapshot doesn't exist: ${destSnapPath}`);
+            }
+          } catch (destError) {
+            console.error(`[Cleanup] Orphan destination error: ${destError instanceof Error ? destError.message : String(destError)}`);
+          }
+        } else {
+          console.warn("[Cleanup] No orphaned snapshots found");
         }
-        
-        const destSnapPath = path.join(config.destMount, newestSnapshot);
-        if (await exists(destSnapPath)) {
-          await removeSnapshot(config.destMount, newestSnapshot);
-        }
+      } catch (error) {
+        console.error(`[Cleanup] Emergency scan error: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   } catch (error) {
