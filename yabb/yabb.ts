@@ -98,11 +98,6 @@ interface AppConfig {
   readonly devicePath?: string;
 }
 
-interface RetryContext extends ErrorContext {
-  readonly retriesLeft?: number;
-  readonly lastError?: unknown;
-}
-
 // ==================== Logger Configuration ====================
 // Initialize typed logger after config but before first use
 const LOG_CONFIG: LogConfig = {
@@ -851,9 +846,6 @@ const createProgressBar = (percent: number): string => {
     Color.green(']');
 };
 
-// ==================== Updated UnifiedErrorHandler ====================
-// Delete this entire class declaration
-
 // ==================== Updated Backup Operations ====================
 const getSnapName = (): string => 
   `${path.basename(config.sourceVol)}.${new Date().toISOString()}`;
@@ -1195,7 +1187,7 @@ const verifyReceivedUuid = async (subvolPath: string): Promise<string> => {
 const verifyUuidMatch = async (sourcePath: string, destPath: string): Promise<void> => {
   const [srcUuid, destUuid] = await Promise.all([
     verifySubvolumeUuid(sourcePath),
-    verifyReceivedUuid(destPath) // Changed to use received UUID check
+    verifyReceivedUuid(destPath) 
   ]);
 
   if (srcUuid !== destUuid) {
