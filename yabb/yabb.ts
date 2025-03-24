@@ -1261,9 +1261,29 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
   const config = parseConfig();
   userFeedback.progress(`Starting incremental backup from ${parentSnap}`, config);
 
-  const parentPath = path.join(config.snapDir, parentSnap);
-  const currentPath = path.join(config.snapDir, getSnapName());
-  const destParentPath = path.join(config.destMount, parentSnap);
+  // Use raw paths without normalization
+  const parentPath = `${config.snapDir}/${parentSnap}`;
+  const destParentPath = `${config.destMount}/${parentSnap}`; // Direct path concatenation
+
+  // Add explicit path validation
+  if (!await exists(parentPath)) {
+    throw new BackupError("Source parent snapshot not found", "ESNAPSHOT", {
+      context: { path: parentPath }
+    });
+  }
+
+  if (!await exists(destParentPath)) {
+    throw new BackupError("Destination parent snapshot not found", "ESNAPSHOT", {
+      context: { 
+        path: destParentPath,
+        suggestions: [
+          "Verify destination snapshot exists with matching name",
+          "Check filesystem compatibility for colon characters",
+          "Perform full backup if parent snapshot is missing"
+        ]
+      }
+    });
+  }
 
   // Verify parent exists and check consistency
   try {
@@ -1276,14 +1296,14 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
     });
   }
 
-  const deltaSize = await estimateDeltaSize(parentPath, currentPath);
+  const deltaSize = await estimateDeltaSize(parentPath, parentPath);
   await checkDestinationSpace(deltaSize, config);
 
   try {
     await verifyUuidMatch(parentPath, destParentPath);
     await executePipeline(
       [
-        ["btrfs", ["send", "-p", parentPath, currentPath]],
+        ["btrfs", ["send", "-p", parentPath, parentPath]],
         ["pv", ["-etab"]],
         ["btrfs", ["receive", config.destMount]]
       ],
