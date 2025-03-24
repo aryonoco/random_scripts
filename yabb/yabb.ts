@@ -766,27 +766,28 @@ const executePipeline = async (
 
 // ==================== Updated Retry Logic ====================
 const retryOperation = async <T>(
-  operation: (signal?: AbortSignal) => Promise<T>,
-  maxRetries: number,
-  retryDelayMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+  maxAttempts: number,
+  baseDelayMs: number,
 ): Promise<T> => {
-  const { signal } = abortController;
+  const controller = new AbortController();
+  const { signal } = controller;
   
   return await retry(async () => {
     try {
-      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
       return await operation(signal);
     } catch (error) {
       if (error instanceof Deno.errors.Interrupted) {
-        userFeedback.warning(`Retry attempt interrupted`, parseConfig());
+        controller.abort();
       }
       throw error;
     }
   }, {
-    maxAttempts: maxRetries + 1,
-    minTimeout: retryDelayMs,
-    jitter: 0.25,
-    multiplier: 1,
+    maxAttempts,
+    minTimeout: baseDelayMs,
+    maxTimeout: baseDelayMs * 4, // Exponential backoff cap
+    jitter: 0.5
   });
 };
 
@@ -1014,12 +1015,12 @@ const userFeedback = {
 };
 
 const checkDestinationSpace = async (requiredBytes: number, config: AppConfig): Promise<void> => {
-  userFeedback.info(`Checking destination free space on ${config.destMount}...`, config);
+  await retryOperation(async () => {
+    userFeedback.info(`Checking destination free space on ${config.destMount}...`, config);
 
-  const bufferBytes = 1_073_741_824;
-  const requiredWithBuffer = requiredBytes + bufferBytes;
+    const bufferBytes = 1_073_741_824;
+    const requiredWithBuffer = requiredBytes + bufferBytes;
 
-  try {
     const fsUsage = await executeCommand("btrfs", [
       "filesystem", "usage", "-b", config.destMount
     ], { signal: abortController.signal });
@@ -1064,25 +1065,20 @@ const checkDestinationSpace = async (requiredBytes: number, config: AppConfig): 
       `Space check passed - ${formatBytes(freeBytes)} available (needed ${formatBytes(requiredWithBuffer)})`,
       config
     );
-  } catch (error) {
-    const message = error instanceof BackupError 
-      ? error.message 
-      : `Unexpected error: ${error instanceof Error ? error.message : String(error)}`;
-    
-    userFeedback.warning(`Space check failed: ${message}`, config);
-    throw error;
-  }
+  }, 2, 3000);
 };
 
 const createSnapshot = async (): Promise<void> => {
   const snapName = getSnapName();
   const snapPath = path.join(config.snapDir, snapName);
   try {
-    await executeCommand("btrfs", [
-      "subvolume", "snapshot", "-r", 
-      config.sourceVol, 
-      snapPath
-    ], { signal: abortController.signal });
+    await retryOperation(async () => {
+      await executeCommand("btrfs", [
+        "subvolume", "snapshot", "-r", 
+        config.sourceVol, 
+        snapPath
+      ], { signal: abortController.signal });
+    }, 3, 5000); // Retry 3 times with 5s delay
     
     const state = BackupState.getInstance();
     state.with({ 
@@ -1173,7 +1169,7 @@ const verifySubvolumeUuid = async (path: string): Promise<string> => {
     const output = new TextDecoder().decode(showOutput.output);
     
     // Match more flexibly, similar to shell script's grep
-    const uuidMatch = output.match(/\buuid:[ \t]+([0-9a-f-]{36})/i);
+    const uuidMatch = output.match(/UUID:\s+([0-9a-f-]{36})/i);
     if (!uuidMatch) throw new UuidMismatchError("Failed to parse source subvolume UUID", {
       cause: new Error("UUID pattern not found in subvolume output"),
       context: { path, outputSnippet: output.slice(0, 200) }
@@ -1194,7 +1190,7 @@ const verifyReceivedUuid = async (subvolPath: string): Promise<string> => {
     const output = new TextDecoder().decode(showOutput.output);
     
     // Match more flexibly, similar to shell script's grep
-    const receivedUuidMatch = output.match(/received[ \t]+uuid:[ \t]+([0-9a-f-]{36})/i);
+    const receivedUuidMatch = output.match(/Received UUID:\s+([0-9a-f-]{36})/i);
     if (!receivedUuidMatch) throw new UuidMismatchError("No received UUID found in destination snapshot", {
       cause: new Error("Received UUID pattern not found in destination output"),
       context: { 
@@ -1439,54 +1435,26 @@ const withLock = async <T>(
 // ==================== Updated Cleanup Process ====================
 const cleanup = async (): Promise<void> => {
   const state = BackupState.getInstance();
-  const appConfig = parseConfig(); // Local configuration for user feedback
+  const appConfig = parseConfig();
   
   try {
     logger.info(`Cleanup state check: snapshotCreated=${state.snapshotCreated}, backupSuccessful=${state.backupSuccessful}, snapshotName=${state.snapshotName}`);
     
-    if (state.snapshotCreated && !state.backupSuccessful && state.snapshotName) {
-      userFeedback.info("Cleaning up failed backup artifacts", appConfig);
-      
-      // First check if source snapshot exists before trying to delete it
-      const sourcePath = path.join(config.snapDir, state.snapshotName);
-      if (await exists(sourcePath)) {
-        userFeedback.info(`Removing source snapshot: ${sourcePath}`, appConfig);
-        try {
-          await retryOperation(
-            async (signal) => {
-              // Use the removeSnapshot function instead of direct command
-              await removeSnapshot(config.snapDir, state.snapshotName, signal);
-              logger.info(`Successfully removed source snapshot: ${sourcePath}`);
-            }, 
-            3, 
-            1000
-          );
-        } catch (error) {
-          logger.error(`Failed to remove source snapshot: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      } else {
-        logger.info(`Source snapshot does not exist: ${sourcePath}`);
+    // Fallback check if state tracking failed
+    const actualSnapshots = [];
+    for await (const entry of Deno.readDir(config.snapDir)) {
+      if (entry.isDirectory && entry.name.startsWith(path.basename(config.sourceVol))) {
+        actualSnapshots.push(entry.name);
       }
-      
-      // Then check destination snapshot
-      const destPath = path.join(config.destMount, state.snapshotName);
-      if (await exists(destPath)) {
-        userFeedback.info(`Removing destination snapshot: ${destPath}`, appConfig);
-        try {
-          await retryOperation(
-            async (signal) => {
-              // Use the removeSnapshot function instead of direct command
-              await removeSnapshot(config.destMount, state.snapshotName, signal);
-              logger.info(`Successfully removed destination snapshot: ${destPath}`);
-            },
-            3,
-            1000
-          );
-        } catch (error) {
-          logger.error(`Failed to remove destination snapshot: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      } else {
-        logger.info(`Destination snapshot does not exist: ${destPath}`);
+    }
+    
+    // If state says no snapshot but we find new ones, attempt cleanup
+    if (!state.snapshotCreated && actualSnapshots.length > 0) {
+      userFeedback.warning("Falling back to directory scan for cleanup", appConfig);
+      const latestSnapshot = actualSnapshots.sort().pop();
+      if (latestSnapshot) {
+        await removeSnapshot(config.snapDir, latestSnapshot);
+        await removeSnapshot(config.destMount, latestSnapshot);
       }
     }
   } catch (error) {
@@ -1534,26 +1502,17 @@ const parseTransactionIdFromPath = async (subvolPath: string): Promise<number> =
   const output = new TextDecoder().decode(showOutput.output);
 
   try {
-    // Use regex pattern similar to shell script instead of CSV parsing
-    const transIdMatch = output.match(/(transid marker was|transaction id):\s+(\d+)/i);
-    
-    if (!transIdMatch || !transIdMatch[2]) {
-      throw new BackupError("Transaction ID not found", "ETRANSID", {
+    // Match exact Generation line from output
+    const generationMatch = output.match(/Generation:\s+(\d+)/);
+    if (!generationMatch) {
+      throw new BackupError("Generation number not found", "ETRANSID", {
         context: {
           outputSnippet: output.slice(0, 200),
-          suggestions: ["Check btrfs subvolume show output format"]
+          suggestions: ["Verify btrfs subvolume show output format"]
         }
       });
     }
-
-    const tid = parseInt(transIdMatch[2], 10);
-    if (isNaN(tid)) {
-      throw new BackupError("Invalid transaction ID format", "ETRANSID", {
-        context: { parsedValue: transIdMatch[2] }
-      });
-    }
-
-    return tid;
+    return parseInt(generationMatch[1], 10);
   } catch (error) {
     throw new BackupError("Transaction ID parsing failed", "ETRANSID", {
       cause: error,
@@ -1605,7 +1564,9 @@ async function ensureMounted(mountPath: string, config: AppConfig): Promise<void
 
     // Then verify if already mounted
     userFeedback.progress(`Verifying mount point: ${normalizedPath}`, config);
-    await executeCommand("mountpoint", ["-q", normalizedPath], { signal: abortController.signal });
+    await retryOperation(async () => {
+      await executeCommand("mountpoint", ["-q", normalizedPath], { signal: abortController.signal });
+    }, 2, 2000);
     userFeedback.info(`Verified mount point: ${normalizedPath}`, config);
   } catch (mountError) {
     // If that fails, try device-based mount
@@ -1623,9 +1584,9 @@ async function ensureMounted(mountPath: string, config: AppConfig): Promise<void
             `Device mount error: ${deviceError instanceof Error ? deviceError.message : String(deviceError)}`
           ],
           suggestions: [
-            "Check if storage device is connected",
+            "Connect storage device and try again",
             "Verify /etc/fstab entries",
-            `Test manual mount: 'sudo mount <device> ${normalizedPath}'`
+            `Test manual mount: 'mount <device> ${normalizedPath}'`
           ]
         }
       });
@@ -1664,7 +1625,8 @@ const findMatchingDevice = async (mountPath: string): Promise<string> => {
         mountPath,
         suggestions: [
           "Connect storage device and try again",
-          "Specify device manually using --device option"
+          "Verify /etc/fstab entries",
+          `Test manual mount: 'mount <device> ${mountPath}'`
         ]
       }
     });
@@ -1726,7 +1688,8 @@ const main = async () => {
       }
     });
   } catch (error) {
-    // Always run cleanup regardless of error
+    // Get fresh state instance before updating
+    BackupState.getInstance().with({ backupSuccessful: false });
     await cleanup();
     const formatter = new ErrorFormatter(parseConfig());
     logger.error("Backup process failed with error:\n" + formatter.format(error));
