@@ -1404,12 +1404,31 @@ const cleanup = async (): Promise<void> => {
     
     if (state.snapshotName && !state.backupSuccessful) {
       console.warn(`[Cleanup] Removing failed snapshot: ${state.snapshotName}`);
-      try {
-        await removeSnapshot(config.snapDir, state.snapshotName);
-        await removeSnapshot(config.destMount, state.snapshotName);
-      } catch (error) {
-        console.error(`[Cleanup Error] Failed to remove snapshot: ${error instanceof Error ? error.message : String(error)}`);
+      
+      // Check if source snapshot exists before attempting removal
+      const sourceSnapPath = path.join(config.snapDir, state.snapshotName);
+      if (await exists(sourceSnapPath)) {
+        try {
+          console.warn(`[Cleanup] Removing source snapshot: ${sourceSnapPath}`);
+          await removeSnapshot(config.snapDir, state.snapshotName);
+        } catch (error) {
+          console.error(`[Cleanup Error] Failed to remove source snapshot: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
+      
+      // Check if destination snapshot exists before attempting removal
+      const destSnapPath = path.join(config.destMount, state.snapshotName);
+      if (await exists(destSnapPath)) {
+        try {
+          console.warn(`[Cleanup] Removing destination snapshot: ${destSnapPath}`);
+          await removeSnapshot(config.destMount, state.snapshotName);
+        } catch (error) {
+          console.error(`[Cleanup Error] Failed to remove destination snapshot: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      } else {
+        console.warn(`[Cleanup] Destination snapshot doesn't exist: ${destSnapPath}`);
+      }
+      
       return;
     }
 
@@ -1418,8 +1437,17 @@ const cleanup = async (): Promise<void> => {
       const newestSnapshot = await findNewestSnapshot();
       if (newestSnapshot) {
         console.warn(`[Cleanup] Removing potential orphan: ${newestSnapshot}`);
-        await removeSnapshot(config.snapDir, newestSnapshot);
-        await removeSnapshot(config.destMount, newestSnapshot);
+        
+        // Apply the same existence check pattern for emergency cleanup
+        const sourceSnapPath = path.join(config.snapDir, newestSnapshot);
+        if (await exists(sourceSnapPath)) {
+          await removeSnapshot(config.snapDir, newestSnapshot);
+        }
+        
+        const destSnapPath = path.join(config.destMount, newestSnapshot);
+        if (await exists(destSnapPath)) {
+          await removeSnapshot(config.destMount, newestSnapshot);
+        }
       }
     }
   } catch (error) {
