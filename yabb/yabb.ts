@@ -1197,8 +1197,8 @@ const verifyReceivedUuid = async (subvolPath: string): Promise<string> => {
     const showOutput = await executeCommand("btrfs", ["subvolume", "show", subvolPath], { signal: abortController.signal });
     const output = new TextDecoder().decode(showOutput.output);
     
-    // Match more flexibly, similar to shell script's grep
-    const receivedUuidMatch = output.match(/(?:Received UUID|UUID):\s+([0-9a-f-]{36})/i);
+    // Match ONLY Received UUID - this is critical for correct comparison
+    const receivedUuidMatch = output.match(/Received UUID:\s+([0-9a-f-]{36})/i);
     if (!receivedUuidMatch) throw new UuidMismatchError("No received UUID found in destination snapshot", {
       cause: new Error("Received UUID pattern not found in destination output"),
       context: { 
@@ -1212,8 +1212,7 @@ const verifyReceivedUuid = async (subvolPath: string): Promise<string> => {
     throw new UuidMismatchError("Destination UUID verification failed", {
       cause: error,
       context: { 
-        path: path.toNamespacedPath(subvolPath),
-        formattedPath: path.format(path.parse(subvolPath))
+        path: path.toNamespacedPath(subvolPath)
       }
     });
   }
