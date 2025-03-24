@@ -1078,13 +1078,13 @@ const createSnapshot = async (): Promise<void> => {
         config.sourceVol, 
         snapPath
       ], { signal: abortController.signal });
-    }, 3, 5000); // Retry 3 times with 5s delay
-    
-    const state = BackupState.getInstance();
-    state.with({ 
-      snapshotCreated: true,
-      snapshotName: snapName
-    });
+      
+      const state = BackupState.getInstance();
+      state.with({ 
+        snapshotCreated: true,
+        snapshotName: snapName
+      });
+    }, 3, 5000);
     
     userFeedback.success(`Created snapshot ${snapPath}`, parseConfig());
   } catch (error) {
@@ -1205,7 +1205,7 @@ const verifyReceivedUuid = async (subvolPath: string): Promise<string> => {
     const output = new TextDecoder().decode(showOutput.output);
     
     // Match more flexibly, similar to shell script's grep
-    const receivedUuidMatch = output.match(/Received UUID:\s+([0-9a-f-]{36})/i);
+    const receivedUuidMatch = output.match(/(?:Received UUID|UUID):\s+([0-9a-f-]{36})/i);
     if (!receivedUuidMatch) throw new UuidMismatchError("No received UUID found in destination snapshot", {
       cause: new Error("Received UUID pattern not found in destination output"),
       context: { 
@@ -1338,7 +1338,7 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
       await verifyUuidMatch(parentPath, destParentPath);
       await executePipeline(
         [
-          ["btrfs", ["send", "-p", parentPath, parentPath]],
+          ["btrfs", ["send", "-p", parentPath, path.join(config.snapDir, BackupState.getInstance().snapshotName)]],
           ["pv", ["-etab"]],
           ["btrfs", ["receive", config.destMount]]
         ],
@@ -1456,17 +1456,23 @@ const cleanup = async (): Promise<void> => {
     logger.info(`Cleanup state check: snapshotCreated=${state.snapshotCreated}, backupSuccessful=${state.backupSuccessful}, snapshotName=${state.snapshotName}`);
     
     // Fallback check if state tracking failed
-    const actualSnapshots = [];
+    const actualSnapshots: Array<{name: string, mtime: number}> = [];
     for await (const entry of Deno.readDir(config.snapDir)) {
       if (entry.isDirectory && entry.name.startsWith(path.basename(config.sourceVol))) {
-        actualSnapshots.push(entry.name);
+        const stat = await Deno.stat(path.join(config.snapDir, entry.name));
+        if (stat.mtime) {
+          actualSnapshots.push({
+            name: entry.name,
+            mtime: stat.mtime.getTime()
+          });
+        }
       }
     }
     
     // If state says no snapshot but we find new ones, attempt cleanup
     if (!state.snapshotCreated && actualSnapshots.length > 0) {
       userFeedback.warning("Falling back to directory scan for cleanup", appConfig);
-      const latestSnapshot = actualSnapshots.sort().pop();
+      const latestSnapshot = actualSnapshots.sort((a, b) => b.mtime - a.mtime)[0]?.name;
       if (latestSnapshot) {
         await removeSnapshot(config.snapDir, latestSnapshot);
         await removeSnapshot(config.destMount, latestSnapshot);
