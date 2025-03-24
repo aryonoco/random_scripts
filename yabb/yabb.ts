@@ -1345,14 +1345,17 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
       throw error;
     }
   } catch (error) {
-    // Enhanced error context
+    // Enhanced error context - create new error instead of mutating
     if (error instanceof BackupError) {
-      error.context = {
-        ...error.context,
-        sourcePath: parentPath,
-        destPath: destParentPath,
-        timestampFormat: "ISO 8601 with colons"
-      };
+      throw new BackupError(error.message, error.code, {
+        cause: error.cause,
+        context: {
+          ...error.context,
+          sourcePath: parentPath,
+          destPath: destParentPath,
+          timestampFormat: "ISO 8601 with colons"
+        }
+      });
     }
     throw error;
   }
