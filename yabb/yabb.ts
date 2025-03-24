@@ -3,7 +3,6 @@
 // To run this script, use the companion yabb.sh script
 
 /// <reference lib="deno.ns" />
-import { delay } from "jsr:@std/async/delay";
 import { retry } from "jsr:@std/async/retry";
 import { abortable, deadline } from "jsr:@std/async";
 
@@ -23,7 +22,7 @@ import { FixedChunkStream } from "jsr:@std/streams/unstable-fixed-chunk-stream";
 import { parse } from "jsr:@std/csv";
 
 import { setup, getLogger, ConsoleHandler } from "jsr:@std/log";
-import type { LogRecord, LevelName, LogConfig } from "jsr:@std/log";
+import type { LogRecord, LogConfig } from "jsr:@std/log";
 
 // ==================== Configuration ====================
 const config = {
@@ -69,34 +68,18 @@ const Color = {
   bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
 };
 
-const LOG_CONFIG: LogConfig = {
-  handlers: {
-    console: new ConsoleHandler("DEBUG", {
-      formatter: (logRecord: LogRecord) => {
-        let message;
-        try {
-          message = logRecord.args.length === 0
-            ? "[No message]"
-            : typeof logRecord.args[0] === 'string'
-              ? logRecord.args[0]
-              : Deno.inspect(logRecord.args[0]);
-        } catch (_error) {
-          message = "Error formatting log message";
-        }
-        return `${logRecord.datetime.toISOString()} [${logRecord.levelName}] ${message}`;
-      },
-      useColors: false,
-    }),
-  },
-  loggers: {
-    default: {
-      level: "DEBUG",
-      handlers: ["console"],
-    },
-  },
-};
-
 // ==================== Interfaces & Types ====================
+// Add logger types here with other type definitions
+type LoggerMethod = (message: string, ...args: unknown[]) => void;
+
+interface AppLogger {
+  debug: LoggerMethod;
+  info: LoggerMethod;
+  warn: LoggerMethod;
+  error: LoggerMethod;
+  critical: LoggerMethod;
+}
+
 interface ErrorContext extends Readonly<Record<string, unknown>> {
   readonly path?: string;
   readonly command?: string[];
@@ -118,6 +101,38 @@ interface RetryContext extends ErrorContext {
   readonly retriesLeft?: number;
   readonly lastError?: unknown;
 }
+
+// ==================== Logger Configuration ====================
+// Initialize typed logger after config but before first use
+const LOG_CONFIG: LogConfig = {
+  handlers: {
+    console: new ConsoleHandler("DEBUG", {
+      formatter: (logRecord: LogRecord) => {
+        let message;
+        try {
+          message = logRecord.args[0] === undefined || logRecord.args.length === 0
+            ? "[No message]"
+            : typeof logRecord.args[0] === 'string'
+              ? logRecord.args[0]
+              : Deno.inspect(logRecord.args[0]);
+        } catch (_error) {
+          message = "Error formatting log message";
+        }
+        return `${logRecord.datetime.toISOString()} [${logRecord.levelName}] ${message}`;
+      },
+      useColors: false,
+    }),
+  },
+  loggers: {
+    default: {
+      level: "DEBUG",
+      handlers: ["console"],
+    },
+  },
+};
+
+// Create typed logger instance after config
+const logger: AppLogger = getLogger();
 
 // ==================== Error Classes ====================
 class BackupError extends Error {
@@ -246,6 +261,7 @@ class BackupState {
   }
 }
 
+// ==================== Error Formatter ====================
 class ErrorFormatter {
   constructor(private readonly config: AppConfig) {}
 
@@ -285,9 +301,7 @@ class ErrorFormatter {
     const indent = "  ".repeat(depth);
     const lines: string[] = [];
     
-    if (!error) {
-      return `${indent}Unknown error occurred`;
-    }
+    if (!error) return `${indent}Unknown error occurred`;
 
     if (error instanceof BackupError) {
       lines.push(
@@ -298,13 +312,11 @@ class ErrorFormatter {
       if (error.context) {
         lines.push(`${indent}${this.colorize("Context:", Color.cyan)}`);
         
-        // Display standard context fields
         for (const [key, value] of Object.entries(error.context)) {
           if (key === 'suggestions' || key === 'recommendation') continue;
           lines.push(`${indent}  ${this.colorize(key + ":", Color.gray)} ${Deno.inspect(value)}`);
         }
 
-        // Display actionable suggestions
         if (error.context.suggestions?.length) {
           lines.push(
             `${indent}${this.colorize("Suggested Actions:", Color.green)}`,
@@ -354,8 +366,7 @@ class ErrorFormatter {
     return lines.join("\n");
   }
 
-  // Add deserialization method
-  static parseSerialized(json: string): unknown {
+  static parse(json: string): unknown {
     return JSON.parse(json, errorReviver);
   }
 }
@@ -590,7 +601,7 @@ const executePipeline = async (
     // Add progress monitoring here
     const pvProcess = processes.find(p => p.isBtrfsSend);
     if (pvProcess && showProgress) {
-      readProgress(pvProcess.wrappedStreams.stderr, showProgress, parseConfig());
+      readProgress(pvProcess.wrappedStreams.stderr, showProgress);
     }
 
     // Collect error streams using ReadableStream
@@ -768,8 +779,7 @@ const retryOperation = async <T>(
 // ==================== Updated Progress Monitoring ====================
 const readProgress = async (
   stderr: ReadableStream<Uint8Array>, 
-  showProgress: boolean,
-  config: AppConfig
+  showProgress: boolean
 ) => {
   const decoder = new TextDecoderStream();
   const lineStream = new TextDelimiterStream("\r");
@@ -777,7 +787,7 @@ const readProgress = async (
   const writer = new WritableStream({
     write: (chunk) => {
       const stats = parsePvOutput(chunk);
-      if(stats) updateProgressDisplay(stats, showProgress, config);
+      if(stats) updateProgressDisplay(stats, showProgress);
     }
   });
 
@@ -813,23 +823,18 @@ const parsePvOutput = (text: string): ProgressStats | null => {
   };
 };
 
-const updateProgressDisplay = (stats: ProgressStats, showProgress: boolean, config: AppConfig) => {
-  const logger = getLogger();
+const updateProgressDisplay = (stats: ProgressStats, showProgress: boolean) => {
   if (showProgress) {
     const progressBar = createProgressBar(stats.percentage);
     logger.info(
       `\rProgress: ${progressBar} ${stats.percentage}% | ` +
       `${formatBytes(stats.bytesTransferred)} | ${stats.throughput} | ` +
-      `Elapsed: ${stats.elapsed} | ETA: ${stats.eta}`,
-      config,
-      "PROGRESS" as LevelName
+      `Elapsed: ${stats.elapsed} | ETA: ${stats.eta}`
     );
   } else {
     logger.info(
       `\rTransfer: ${formatBytes(stats.bytesTransferred)} | ` +
-      `${stats.throughput} | Elapsed: ${stats.elapsed}`,
-      config,
-      "PROGRESS" as LevelName
+      `${stats.throughput} | Elapsed: ${stats.elapsed}`
     );
   }
 };
@@ -972,26 +977,22 @@ const estimateDeltaSize = async (
 // ==================== Interactive Feedback ====================
 const userFeedback = {
   info: (message: string, config: AppConfig) => {
-    const logger = getLogger();
     logger.info(config.colorOutput ? Color.cyan(message) : message);
   },
   warning: (message: string, config: AppConfig) => {
-    const logger = getLogger();
     logger.warn(config.colorOutput ? Color.yellow(message) : message);
   },
   success: (message: string, config: AppConfig) => {
-    const logger = getLogger();
     logger.info(config.colorOutput ? Color.green(message) : message);
   },
   progress: (message: string, config: AppConfig) => {
     if (config.showProgress && !config.jsonOutput) {
-      const logger = getLogger();
       logger.info(message);
     }
   },
   error: (message: string, config: AppConfig) => {
-    const logger = getLogger();
-    logger.error(config.colorOutput ? Color.red(message) : message);
+    const formatter = new ErrorFormatter(config);
+    logger.error(formatter.format(message));
   }
 };
 
@@ -1399,28 +1400,15 @@ const cleanup = async (): Promise<void> => {
       const results = await Promise.allSettled(cleanupOps);
       for (const result of results) {
         if (result.status === "rejected") {
-          throw result.reason;
+          const error = result.reason;
+          if (error instanceof BackupError) throw error;
+          throw new BackupError("Cleanup failed", "ETEMP", { cause: error });
         }
       }
     }
   } catch (error) {
-    if (error instanceof Deno.errors.NotFound) {
-      // Ignore missing files during cleanup
-      return;
-    }
-    if (error instanceof Deno.errors.PermissionDenied) {
-      throw new BackupError("Cleanup permission denied", "ETEMP", {
-        context: {
-          suggestion: "Run with appropriate permissions"
-        }
-      });
-    }
-    if (error instanceof Deno.errors.Interrupted) {
-      userFeedback.warning("Cleanup interrupted, retrying...", parseConfig());
-      await delay(500);
-      return cleanup();
-    }
-    throw error;
+    const formatter = new ErrorFormatter(parseConfig());
+    logger.error("Cleanup failed:\n" + formatter.format(error));
   }
   
   try {
@@ -1444,13 +1432,11 @@ const verifyDependencies = async (): Promise<void> => {
     });
     
     if (!binExists) {
+      userFeedback.error(`Missing required dependency: ${bin}`, parseConfig());
       throw new BackupError(`Missing dependency: ${bin}`, "EDEPENDENCY", {
         context: { 
           binPath,
-          suggestions: [
-            `Install package containing ${bin}`,
-            "Verify PATH environment variable"
-          ]
+          suggestions: [`Install package containing ${bin}`]
         }
       });
     }
@@ -1464,17 +1450,11 @@ const verifyMountPoint = async (mountPath: string): Promise<void> => {
     userFeedback.progress(`Verifying mount point: ${normalizedPath}`, parseConfig());
     await executeCommand("mountpoint", ["-q", normalizedPath], { signal: abortController.signal });
   } catch (error) {
-    const parsedPath = path.parse(normalizedPath);
+    const formatter = new ErrorFormatter(parseConfig());
+    logger.error("Mount verification failed:\n" + formatter.format(error));
     throw new BackupError("Mount point verification failed", "EMOUNT", {
       cause: error,
-      context: {
-        action: 'verify',
-        path: path.toNamespacedPath(normalizedPath),
-        suggestions: [
-          `Check mount status: mount | grep ${parsedPath.base}`,
-          `Verify fstab entry for ${parsedPath.dir}`
-        ]
-      }
+      context: { path: normalizedPath }
     });
   }
 };
@@ -1607,19 +1587,19 @@ const main = async () => {
     await withLock(async () => {
       const state = BackupState.getInstance();
       
-      userFeedback.info("Starting backup process", config);
+      logger.info("Starting backup process");
       try {
         await verifyDependencies();
-        userFeedback.info("Dependencies verified", config);
+        logger.info("Dependencies verified successfully");
         
         await ensureMounted(config.sourceVol, config);
-        userFeedback.info(`Mounted source volume: ${config.sourceVol}`, config);
+        logger.info(`Mounted source volume: ${config.sourceVol}`);
         
         await ensureMounted(config.destMount, config);
-        userFeedback.info(`Mounted destination: ${config.destMount}`, config);
+        logger.info(`Mounted destination: ${config.destMount}`);
 
         // Create new snapshot
-        userFeedback.progress("Creating new snapshot...", config);
+        logger.info("Creating new snapshot...");
         await createSnapshot();
         const newState = state.with({ snapshotCreated: true });
 
@@ -1629,60 +1609,38 @@ const main = async () => {
 
         // Perform backup
         if (isFullBackup) {
-          userFeedback.info("Starting full backup", config);
+          logger.info("Starting full backup");
           await performFullBackup(config.showProgress);
         } else {
-          userFeedback.info(`Starting incremental backup from ${parentSnap}`, config);
+          logger.info(`Starting incremental backup from ${parentSnap}`);
           await performIncrementalBackup(parentSnap, config.showProgress);
         }
 
         // Update success state
         newState.with({ backupSuccessful: true });
-        userFeedback.success("Backup completed successfully", config);
+        logger.info("Backup completed successfully");
       } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
-        userFeedback.error(`Backup failed: ${errMsg}`, config);
+        logger.error("Backup failed:", errMsg);
         throw error;
       }
     });
   } catch (error) {
     await cleanup();
-    const logger = getLogger();
-    const formattedError = error ? 
-      (error instanceof Error ? error.message : String(error)) : 
-      "Unknown error occurred";
-    logger.error(formattedError);
+    const formatter = new ErrorFormatter(parseConfig());
+    logger.error("Backup process failed with error:\n" + formatter.format(error));
     Deno.exit(1);
   }
 };
 
 // Final verification of main error handler
-main().catch(error => {
+main().catch((error: unknown) => {
+  const formatter = new ErrorFormatter(parseConfig());
   try {
-    const logger = getLogger();
-    let formattedError;
-    
-    try {
-      const formatter = new ErrorFormatter(parseConfig());
-      formattedError = error 
-        ? (error instanceof Error 
-            ? formatter.format(error) 
-            : `Non-Error: ${Deno.inspect(error)}`) 
-        : "Unknown error occurred";
-    } catch (formatError) {
-      // Fallback if formatter fails
-      formattedError = error instanceof Error 
-        ? `${error.name}: ${error.message}` 
-        : String(error || "Unknown error");
-      
-      console.error("Error while formatting error:", formatError);
-    }
-    
-    logger.error(formattedError);
+    logger.error("Fatal application error:\n" + formatter.format(error));
   } catch (loggerError) {
-    // Last resort if logger fails
     console.error("Original error:", error);
-    console.error("Logger error:", loggerError);
+    console.error("Logger failure:", formatter.format(loggerError));
   } finally {
     Deno.exit(1);
   }
