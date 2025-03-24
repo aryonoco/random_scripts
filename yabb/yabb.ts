@@ -71,10 +71,10 @@ const LOG_CONFIG: LogConfig = {
   handlers: {
     console: new ConsoleHandler("DEBUG", {
       formatter: (logRecord: LogRecord) => {
-        const message = customFormatter(logRecord);
-        return logRecord.levelName === "PROGRESS" 
-          ? message 
-          : `${logRecord.datetime.toISOString()} ${message}`;
+        const message = typeof logRecord.args[0] === 'string' 
+          ? logRecord.args[0] 
+          : Deno.inspect(logRecord.args[0]);
+        return `${logRecord.datetime.toISOString()} [${logRecord.levelName}] ${message}`;
       },
       useColors: false,
     }),
@@ -86,38 +86,6 @@ const LOG_CONFIG: LogConfig = {
     },
   },
 };
-
-function customFormatter(logRecord: LogRecord): string {
-  const { levelName, args } = logRecord;
-  const [message, config] = args as [string, AppConfig];
-  const rest = args.slice(2);
-
-  const colorMap: Record<string, (text: string) => string> = {
-    DEBUG: Color.gray,
-    INFO: Color.cyan,
-    WARN: Color.yellow,
-    ERROR: Color.red,
-    CRITICAL: Color.red,
-    SUCCESS: Color.green,
-    PROGRESS: Color.gray,
-  };
-
-  const symbolMap: Record<string, string> = {
-    INFO: "ℹ️",
-    WARN: "⚠️",
-    SUCCESS: "✅",
-    PROGRESS: "⌛",
-    ERROR: "❌",
-    CRITICAL: "💥",
-  };
-
-  const symbol = symbolMap[levelName] || "";
-  const coloredMessage = config.colorOutput && colorMap[levelName]
-    ? colorMap[levelName](`${symbol} ${message}`)
-    : `${symbol} ${message}`;
-
-  return coloredMessage + (rest.length > 0 ? ` ${rest.join(" ")}` : "");
-}
 
 // ==================== Interfaces & Types ====================
 interface ErrorContext extends Readonly<Record<string, unknown>> {
@@ -176,13 +144,13 @@ class UuidMismatchError extends BackupError {
       sourcePath?: string;
       destPath?: string;
       recommendation?: string;
+      cause?: unknown;
     } & ErrorContext
   ) {
-    super(message, "EUUID", { context });
-    
-    if (context.cause instanceof Error) {
-      this.stack = `${this.stack}\nCaused by: ${context.cause.stack}`;
-    }
+    super(message, "EUUID", { 
+      context,
+      cause: context.cause
+    });
   }
 
   override toJSON() {
@@ -992,24 +960,25 @@ const estimateDeltaSize = async (
 const userFeedback = {
   info: (message: string, config: AppConfig) => {
     const logger = getLogger();
-    if (!config.jsonOutput) logger.info(message, config);
+    logger.info(config.colorOutput ? Color.cyan(message) : message, config);
   },
-  
   warning: (message: string, config: AppConfig) => {
     const logger = getLogger();
-    if (!config.jsonOutput) logger.warn(message, config);
+    logger.warn(config.colorOutput ? Color.yellow(message) : message, config);
   },
-
   success: (message: string, config: AppConfig) => {
     const logger = getLogger();
-    if (!config.jsonOutput) logger.info(message, config, "SUCCESS" as LevelName);
+    logger.info(config.colorOutput ? Color.green(message) : message, config, "SUCCESS" as LevelName);
   },
-
   progress: (message: string, config: AppConfig) => {
-    const logger = getLogger();
     if (config.showProgress && !config.jsonOutput) {
+      const logger = getLogger();
       logger.info(message, config, "PROGRESS" as LevelName);
     }
+  },
+  error: (message: string, config: AppConfig) => {
+    const logger = getLogger();
+    logger.error(config.colorOutput ? Color.red(message) : message, config, "CRITICAL" as LevelName);
   }
 };
 
@@ -1065,9 +1034,11 @@ const checkDestinationSpace = async (requiredBytes: number, config: AppConfig): 
       config
     );
   } catch (error) {
-    userFeedback.warning(`Space check failed: ${
-      error instanceof Error ? error.message : "Unknown error"
-    }`, config);
+    const message = error instanceof BackupError 
+      ? error.message 
+      : `Unexpected error: ${error instanceof Error ? error.message : String(error)}`;
+    
+    userFeedback.warning(`Space check failed: ${message}`, config);
     throw error;
   }
 };
@@ -1610,9 +1581,8 @@ async function ensureMounted(path: string, config: AppConfig): Promise<void> {
 
 // ==================== Modified Main Workflow ====================
 const main = async () => {
-  await setup(LOG_CONFIG);
+  setup(LOG_CONFIG);
   const config = parseConfig();
-  const formatter = new ErrorFormatter(config);
 
   // Register signal handlers when execution starts
   Deno.addSignalListener("SIGINT", signalHandlers.SIGINT);
@@ -1624,36 +1594,51 @@ const main = async () => {
     await withLock(async () => {
       const state = BackupState.getInstance();
       
-      await verifyDependencies();
-      await ensureMounted(config.sourceVol, config);
-      await ensureMounted(config.destMount, config);
+      userFeedback.info("Starting backup process", config);
+      try {
+        await verifyDependencies();
+        userFeedback.info("Dependencies verified", config);
+        
+        await ensureMounted(config.sourceVol, config);
+        userFeedback.info(`Mounted source volume: ${config.sourceVol}`, config);
+        
+        await ensureMounted(config.destMount, config);
+        userFeedback.info(`Mounted destination: ${config.destMount}`, config);
 
-      // Create new snapshot
-      userFeedback.progress("Creating new snapshot...", config);
-      await createSnapshot();
-      const newState = state.with({ snapshotCreated: true });
+        // Create new snapshot
+        userFeedback.progress("Creating new snapshot...", config);
+        await createSnapshot();
+        const newState = state.with({ snapshotCreated: true });
 
-      // Determine backup type
-      const parentSnap = await findParentSnapshot();
-      const isFullBackup = parentSnap === null;
+        // Determine backup type
+        const parentSnap = await findParentSnapshot();
+        const isFullBackup = parentSnap === null;
 
-      // Perform backup
-      if (isFullBackup) {
-        userFeedback.info("Starting full backup", config);
-        await performFullBackup(config.showProgress);
-      } else {
-        userFeedback.info(`Starting incremental backup from ${parentSnap}`, config);
-        await performIncrementalBackup(parentSnap, config.showProgress);
+        // Perform backup
+        if (isFullBackup) {
+          userFeedback.info("Starting full backup", config);
+          await performFullBackup(config.showProgress);
+        } else {
+          userFeedback.info(`Starting incremental backup from ${parentSnap}`, config);
+          await performIncrementalBackup(parentSnap, config.showProgress);
+        }
+
+        // Update success state
+        newState.with({ backupSuccessful: true });
+        userFeedback.success("Backup completed successfully", config);
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        userFeedback.error(`Backup failed: ${errMsg}`, config);
+        throw error;
       }
-
-      // Update success state
-      newState.with({ backupSuccessful: true });
-      userFeedback.success("Backup completed successfully", config);
     });
   } catch (error) {
     await cleanup();
     const logger = getLogger();
-    logger.error(formatter.format(error), config, "CRITICAL" as LevelName);
+    const formattedError = error instanceof Error 
+      ? error.message 
+      : `Non-Error exception: ${String(error)}`;
+    logger.error(formattedError, parseConfig(), "CRITICAL" as LevelName);
     Deno.exit(1);
   }
 };
@@ -1662,6 +1647,9 @@ const main = async () => {
 main().catch(error => {
   const logger = getLogger();
   const formatter = new ErrorFormatter(parseConfig());
-  logger.error(formatter.format(error), parseConfig(), "CRITICAL" as LevelName);
+  const formattedError = error instanceof Error 
+    ? formatter.format(error) 
+    : `Non-Error exception: ${String(error)}`;
+  logger.error(formattedError, parseConfig(), "CRITICAL" as LevelName);
   Deno.exit(1);
 });
