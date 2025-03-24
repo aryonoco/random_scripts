@@ -871,6 +871,15 @@ const getSnapName = (): string => {
     `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())}Z`;
 };
 
+const removeSnapshot = async (
+  basePath: string,
+  snapName: string,
+  signal?: AbortSignal
+): Promise<void> => {
+  const snapPath = path.join(basePath, snapName);
+  await executeCommand("btrfs", ["subvolume", "delete", snapPath], { signal });
+};
+
 const estimateDeltaSize = async (
   parentPath: string,
   currentPath: string
@@ -1442,11 +1451,19 @@ const cleanup = async (): Promise<void> => {
       const sourcePath = path.join(config.snapDir, state.snapshotName);
       if (await exists(sourcePath)) {
         userFeedback.info(`Removing source snapshot: ${sourcePath}`, appConfig);
-        await retryOperation(
-          (signal) => removeSnapshot(config.snapDir, state.snapshotName, signal),
-          3,
-          1000
-        );
+        try {
+          await retryOperation(
+            async (signal) => {
+              // Use the removeSnapshot function instead of direct command
+              await removeSnapshot(config.snapDir, state.snapshotName, signal);
+              logger.info(`Successfully removed source snapshot: ${sourcePath}`);
+            }, 
+            3, 
+            1000
+          );
+        } catch (error) {
+          logger.error(`Failed to remove source snapshot: ${error instanceof Error ? error.message : String(error)}`);
+        }
       } else {
         logger.info(`Source snapshot does not exist: ${sourcePath}`);
       }
@@ -1455,11 +1472,19 @@ const cleanup = async (): Promise<void> => {
       const destPath = path.join(config.destMount, state.snapshotName);
       if (await exists(destPath)) {
         userFeedback.info(`Removing destination snapshot: ${destPath}`, appConfig);
-        await retryOperation(
-          (signal) => removeSnapshot(config.destMount, state.snapshotName, signal),
-          3,
-          1000
-        );
+        try {
+          await retryOperation(
+            async (signal) => {
+              // Use the removeSnapshot function instead of direct command
+              await removeSnapshot(config.destMount, state.snapshotName, signal);
+              logger.info(`Successfully removed destination snapshot: ${destPath}`);
+            },
+            3,
+            1000
+          );
+        } catch (error) {
+          logger.error(`Failed to remove destination snapshot: ${error instanceof Error ? error.message : String(error)}`);
+        }
       } else {
         logger.info(`Destination snapshot does not exist: ${destPath}`);
       }
