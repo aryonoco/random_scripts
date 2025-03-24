@@ -1700,16 +1700,23 @@ const main = async () => {
         state.with({ backupSuccessful: true });
         logger.info("Backup completed successfully");
       } catch (error) {
-        // Explicitly ensure backupSuccessful is false
-        state.with({ backupSuccessful: false });
+        // Explicitly ensure backupSuccessful is false WITHOUT changing other state
+        // Do NOT reset snapshotCreated or snapshotName here
+        const currentState = BackupState.getInstance();
+        currentState.with({ backupSuccessful: false });
+        
         const errMsg = error instanceof Error ? error.message : String(error);
         logger.error("Backup failed:", errMsg);
         throw error;
       }
     });
   } catch (error) {
-    // Get fresh state instance before updating
-    BackupState.getInstance().with({ backupSuccessful: false });
+    // Preserve snapshot info during error handling
+    const currentState = BackupState.getInstance();
+    
+    // Set only backupSuccessful without resetting other state values
+    currentState.with({ backupSuccessful: false });
+    
     await cleanup();
     const formatter = new ErrorFormatter(parseConfig());
     logger.error("Backup process failed with error:\n" + formatter.format(error));
