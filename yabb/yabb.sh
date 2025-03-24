@@ -14,8 +14,8 @@ fi
 # Run Deno with all required permissions and flags
 exec deno run \
   --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test,lsblk,blkid \
-  --allow-read=/data,/mnt/external,/var/lock,/usr/bin,/etc/mtab,/dev,/proc,/sys \
-  --allow-write=/data/.snapshots,/mnt/external,/var/lock,/tmp \
+  --allow-read=/,/dev,/proc,/sys,/run/udev,/etc/mtab,/etc/fstab \
+  --allow-write=/data,/mnt/external,/var/lock,/tmp \
   --allow-env=TZ,HOME,USER \
   --allow-net=jsr.io,registry.npmjs.org,cdn.jsdelivr.net \
   --allow-sys \
