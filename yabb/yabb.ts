@@ -1095,42 +1095,29 @@ const createSnapshot = async (): Promise<void> => {
   }
 };
 
-const findParentSnapshot = async (): Promise<string | null> => {
+async function findParentSnapshot(): Promise<string | null> {
   try {
-    const currentSnap = getSnapName();
-    const sourceBaseName = path.basename(config.sourceVol);
+    // Get the ACTUAL snapshot name from state instead of generating a new one
+    const state = BackupState.getInstance();
+    const currentSnap = state.snapshotName; // Use stored name instead of getSnapName()
     
-    // Get all snapshots and their stats
+    const sourceBaseName = path.basename(config.sourceVol);
     const snapshots: Array<{ name: string; mtime: number }> = [];
+    
     for await (const entry of Deno.readDir(config.snapDir)) {
-      // Only consider directories matching our pattern
-      if (!entry.isDirectory || !entry.name.startsWith(sourceBaseName)) {
-        continue;
-      }
-      
-      // Skip the current snapshot we just created
-      if (entry.name === currentSnap) {
-        continue;
-      }
+      if (!entry.isDirectory || !entry.name.startsWith(sourceBaseName)) continue;
+      if (entry.name === currentSnap) continue; // Now correctly skips actual current snapshot
       
       const stat = await Deno.stat(path.join(config.snapDir, entry.name));
-      if (stat.mtime) {
-        snapshots.push({ 
-          name: entry.name, 
-          mtime: stat.mtime.getTime() 
-        });
-      }
+      if (stat.mtime) snapshots.push({ name: entry.name, mtime: stat.mtime.getTime() });
     }
-    
-    // No snapshots found
+
     if (snapshots.length === 0) {
       logger.info("No existing snapshots found in " + config.snapDir);
       return null;
     }
-    
-    // Sort by modification time, newest first
+
     snapshots.sort((a, b) => b.mtime - a.mtime);
-    
     logger.info(`Found previous snapshots, selecting newest: ${snapshots[0].name}`);
     return snapshots[0].name;
   } catch (error) {
@@ -1143,10 +1130,12 @@ const findParentSnapshot = async (): Promise<string | null> => {
       }
     });
   }
-};
+}
 
 const performFullBackup = async (showProgress: boolean): Promise<void> => {
-  const currentPath = path.join(config.snapDir, getSnapName());
+  const state = BackupState.getInstance();
+  // Use the stored snapshot name instead of generating a new one
+  const currentPath = path.join(config.snapDir, state.snapshotName);
   
   try {
     const sizeResult = await executeCommand("btrfs", [
