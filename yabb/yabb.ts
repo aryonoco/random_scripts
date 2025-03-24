@@ -1097,33 +1097,33 @@ const createSnapshot = async (): Promise<void> => {
 
 const findParentSnapshot = async (): Promise<string | null> => {
   try {
-    const pattern = `${path.basename(config.sourceVol)}.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z`;
+    const pattern = `${path.basename(config.sourceVol)}.*`;
     const options = {
       root: config.snapDir,
       maxDepth: 1,
-      exclude: [getSnapName()],
       includeDirs: true,
       extended: true,
     };
 
-    let latestSnap: { path: string; mtime: Date } | null = null;
+    const snapshots: Array<{ path: string; mtime: Date }> = [];
     for await (const entry of expandGlob(pattern, options)) {
-      if (!entry.isDirectory) continue;
-      const info = await Deno.stat(entry.path);
-      const mtime = info.mtime ?? new Date(0); // Handle null mtime
+      if (!entry.isDirectory || entry.name === getSnapName()) continue;
       
-      if (!latestSnap || mtime > latestSnap.mtime) {
-        latestSnap = { path: entry.path, mtime };
-      }
+      const info = await Deno.stat(entry.path);
+      const mtime = info.mtime ?? new Date(0);
+      snapshots.push({ path: entry.path, mtime });
     }
 
-    return latestSnap ? path.basename(latestSnap.path) : null;
+    // Sort by mtime descending, using numeric timestamp for comparison
+    snapshots.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+
+    return snapshots.length > 0 ? path.basename(snapshots[0].path) : null;
   } catch (error) {
     throw new BackupError("Failed to find parent snapshot", "ESNAPSHOT", {
       cause: error,
       context: {
         snapDir: config.snapDir,
-        pattern: `${path.basename(config.sourceVol)}.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z`,
+        pattern: `${path.basename(config.sourceVol)}.*`,
         suggestions: ["Verify snapshot directory structure"]
       }
     });
