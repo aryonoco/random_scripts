@@ -1290,12 +1290,31 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
   }
 };
 
-// ==================== Core Functionality ====================
+// ==================== Updated Core Functionality ====================
 const withLock = async <T>(
   fn: (file: Deno.FsFile) => Promise<T>
 ): Promise<T> => {
+  // Ensure lock file and directory exist with proper permissions
+  try {
+    await ensureFile(config.lockFile);
+    await Deno.chmod(config.lockFile, config.lockFileMode);
+  } catch (error) {
+    throw new BackupError("Failed to initialize lock file", "ELOCK", {
+      cause: error,
+      context: {
+        path: config.lockFile,
+        mode: config.lockFileMode.toString(8),
+        suggestions: [
+          "Check directory permissions for: " + path.dirname(config.lockFile),
+          "Verify filesystem has enough inodes",
+          "Ensure parent directory exists"
+        ]
+      }
+    });
+  }
+
   const file = await Deno.open(config.lockFile, {
-    create: true,
+    create: false, // Now explicitly not creating since we ensured it exists
     mode: config.lockFileMode,
     read: true,
     write: true,
@@ -1517,31 +1536,6 @@ const extractUuidFromOutput = (output: Uint8Array): string | null => {
   return text.match(/UUID:\s+([0-9a-f-]{36})/i)?.[1] ?? null;
 };
 
-// ==================== Updated Lockfile Verification ====================
-const verifyLockFile = async (): Promise<void> => {
-  try {
-    await Deno.lstat(config.lockFile);
-  } catch (error) {
-    const context: ErrorContext = {
-      path: config.lockFile,
-      suggestions: error instanceof Deno.errors.NotFound ? [
-        "Lock file does not exist - creating new one"
-      ] : error instanceof Deno.errors.PermissionDenied ? [
-        "Run with appropriate permissions (try sudo)",
-        `Check ownership of ${config.lockFile}`
-      ] : []
-    };
-
-    const code = error instanceof Deno.errors.AlreadyExists ? "ELOCK" :
-      error instanceof Deno.errors.PermissionDenied ? "EINVALID" : "ELOCK";
-
-    throw new BackupError("Lock file verification failed", code, {
-      cause: error,
-      context
-    });
-  }
-};
-
 // ==================== Updated Mount Operations ====================
 async function ensureMounted(path: string, config: AppConfig): Promise<void> {
   try {
@@ -1583,7 +1577,7 @@ const main = async () => {
   Deno.addSignalListener("SIGHUP", signalHandlers.SIGHUP);
 
   try {
-    await verifyLockFile();
+    // Direct locking without separate verification
     await withLock(async () => {
       const state = BackupState.getInstance();
       
