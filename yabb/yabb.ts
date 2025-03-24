@@ -1273,64 +1273,87 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
   const config = parseConfig();
   userFeedback.progress(`Starting incremental backup from ${parentSnap}`, config);
 
-  // Use raw paths without normalization
-  const parentPath = `${config.snapDir}/${parentSnap}`;
-  const destParentPath = `${config.destMount}/${parentSnap}`; // Direct path concatenation
+  // Use direct path construction without URL encoding
+  const parentPath = path.join(config.snapDir, parentSnap);
+  const destParentPath = path.join(config.destMount, parentSnap);
 
-  // Add explicit path validation
-  if (!await exists(parentPath)) {
-    throw new BackupError("Source parent snapshot not found", "ESNAPSHOT", {
-      context: { path: parentPath }
-    });
-  }
-
-  if (!await exists(destParentPath)) {
-    throw new BackupError("Destination parent snapshot not found", "ESNAPSHOT", {
-      context: { 
-        path: destParentPath,
-        suggestions: [
-          "Verify destination snapshot exists with matching name",
-          "Check filesystem compatibility for colon characters",
-          "Perform full backup if parent snapshot is missing"
-        ]
-      }
-    });
-  }
-
-  // Verify parent exists and check consistency
-  try {
-    await executeCommand("btrfs", ["subvolume", "show", destParentPath], { signal: abortController.signal });
-    await verifySnapshotConsistency(parentPath, destParentPath);
-  } catch (error) {
-    throw new BackupError("Parent snapshot verification failed", "ESNAPSHOT", {
-      cause: error,
-      context: { parentPath: destParentPath }
-    });
-  }
-
-  const deltaSize = await estimateDeltaSize(parentPath, parentPath);
-  await checkDestinationSpace(deltaSize, config);
-
-  try {
-    await verifyUuidMatch(parentPath, destParentPath);
-    await executePipeline(
-      [
-        ["btrfs", ["send", "-p", parentPath, parentPath]],
-        ["pv", ["-etab"]],
-        ["btrfs", ["receive", config.destMount]]
-      ],
-      deltaSize,
-      showProgress
-    );
-    userFeedback.success(`Incremental backup completed successfully (${formatBytes(deltaSize)})`, config);
-  } catch (error) {
-    if (error instanceof UuidMismatchError) {
-      userFeedback.warning(
-        `UUID mismatch detected: ${error.context.sourceUuid} vs ${error.context.destUuid}`,
-        parseConfig()
-      );
+  // Add explicit colon preservation
+  const validatePathFormat = (p: string) => {
+    if (!p.includes(':')) {
+      throw new BackupError("Invalid snapshot path format", "EINVALID", {
+        context: {
+          path: p,
+          suggestions: ["Verify snapshot naming convention with colons"]
+        }
+      });
     }
-    userFeedback.warning(`Incremental backup failed after ${formatBytes(deltaSize)} transferred`, config);
+  };
+
+  try {
+    validatePathFormat(parentPath);
+    validatePathFormat(destParentPath);
+
+    if (!await exists(parentPath)) {
+      throw new BackupError("Source parent snapshot not found", "ESNAPSHOT", {
+        context: { path: parentPath }
+      });
+    }
+
+    if (!await exists(destParentPath)) {
+      throw new BackupError("Destination parent snapshot not found", "ESNAPSHOT", {
+        context: { 
+          path: destParentPath,
+          suggestions: ["Perform full backup to establish baseline"]
+        }
+      });
+    }
+
+    // Verify parent exists and check consistency
+    try {
+      await executeCommand("btrfs", ["subvolume", "show", destParentPath], { signal: abortController.signal });
+      await verifySnapshotConsistency(parentPath, destParentPath);
+    } catch (error) {
+      throw new BackupError("Parent snapshot verification failed", "ESNAPSHOT", {
+        cause: error,
+        context: { parentPath: destParentPath }
+      });
+    }
+
+    const deltaSize = await estimateDeltaSize(parentPath, parentPath);
+    await checkDestinationSpace(deltaSize, config);
+
+    try {
+      await verifyUuidMatch(parentPath, destParentPath);
+      await executePipeline(
+        [
+          ["btrfs", ["send", "-p", parentPath, parentPath]],
+          ["pv", ["-etab"]],
+          ["btrfs", ["receive", config.destMount]]
+        ],
+        deltaSize,
+        showProgress
+      );
+      userFeedback.success(`Incremental backup completed successfully (${formatBytes(deltaSize)})`, config);
+    } catch (error) {
+      if (error instanceof UuidMismatchError) {
+        userFeedback.warning(
+          `UUID mismatch detected: ${error.context.sourceUuid} vs ${error.context.destUuid}`,
+          parseConfig()
+        );
+      }
+      userFeedback.warning(`Incremental backup failed after ${formatBytes(deltaSize)} transferred`, config);
+      throw error;
+    }
+  } catch (error) {
+    // Enhanced error context
+    if (error instanceof BackupError) {
+      error.context = {
+        ...error.context,
+        sourcePath: parentPath,
+        destPath: destParentPath,
+        timestampFormat: "ISO 8601 with colons"
+      };
+    }
     throw error;
   }
 };
