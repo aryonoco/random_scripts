@@ -1018,7 +1018,7 @@ const checkDestinationSpace = async (requiredBytes: number, config: AppConfig): 
   await retryOperation(async () => {
     userFeedback.info(`Checking destination free space on ${config.destMount}...`, config);
 
-    const bufferBytes = 1_073_741_824;
+    const bufferBytes = 1_073_741_824; // 1GB buffer
     const requiredWithBuffer = requiredBytes + bufferBytes;
 
     const fsUsage = await executeCommand("btrfs", [
@@ -1026,26 +1026,24 @@ const checkDestinationSpace = async (requiredBytes: number, config: AppConfig): 
     ], { signal: abortController.signal });
     
     const usageOutput = new TextDecoder().decode(fsUsage.output);
-    const [, ...rows] = parse(usageOutput, {
-      delimiter: " ",
-      skipFirstRow: true,
-      trimLeadingSpace: true,
-      comment: "#"
-    });
-
-    const freeRow = rows.find(row => row[0] === "Free");
-    if (!freeRow) {
+    
+    // Match the "Free (estimated)" line directly with regex
+    const freeMatch = usageOutput.match(/Free \(estimated\):\s+(\d+)/);
+    
+    if (!freeMatch || !freeMatch[1]) {
       throw new BackupError("Failed to parse btrfs output", "EINVALID", {
-        context: { usageOutput }
+        context: { 
+          usageOutput: usageOutput.slice(0, 500),
+          suggestions: ["Check if btrfs filesystem usage output format has changed"]
+        }
       });
     }
 
-    const freeBytes = Number(freeRow?.[3] ?? "0");
+    const freeBytes = Number(freeMatch[1]);
     if (isNaN(freeBytes)) {
       throw new BackupError("Invalid free space value", "EINVALID", {
         context: {
-          parsedValue: freeRow?.[3],
-          rawRow: freeRow,
+          parsedValue: freeMatch[1],
           suggestions: ["Check btrfs filesystem usage output format"]
         }
       });
