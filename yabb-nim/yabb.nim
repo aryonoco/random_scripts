@@ -1,6 +1,6 @@
 import std/[algorithm, osproc, strutils, strformat, os, math, sequtils, posix, times, logging, options, syncio]
 
-#
+
 try:
   putEnv("LC_ALL", "C")
 except OSError:
