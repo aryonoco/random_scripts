@@ -440,7 +440,9 @@ const ALLOWED_COMMANDS = new Set([
   "pv",
   "du",
   "which",
-  "test"
+  "test",
+  "lsblk",
+  "blkid"
 ] as const);
 
 type AllowedCommand = typeof ALLOWED_COMMANDS extends Set<infer T> ? T : never;
@@ -1463,22 +1465,6 @@ const verifyDependencies = async (): Promise<void> => {
   }));
 };
 
-const verifyMountPoint = async (mountPath: string): Promise<void> => {
-  const normalizedPath = path.normalize(mountPath);
-  
-  try {
-    userFeedback.progress(`Verifying mount point: ${normalizedPath}`, parseConfig());
-    await executeCommand("mountpoint", ["-q", normalizedPath], { signal: abortController.signal });
-  } catch (error) {
-    const formatter = new ErrorFormatter(parseConfig());
-    logger.error("Mount verification failed:\n" + formatter.format(error));
-    throw new BackupError("Mount point verification failed", "EMOUNT", {
-      cause: error,
-      context: { path: normalizedPath }
-    });
-  }
-};
-
 const parseTransactionIdFromPath = async (subvolPath: string): Promise<number> => {
   const normalizedPath = path.normalize(subvolPath);
   const showOutput = await executeCommand("btrfs", ["subvolume", "show", normalizedPath], { signal: abortController.signal });
@@ -1568,45 +1554,25 @@ async function ensureMounted(mountPath: string, config: AppConfig): Promise<void
     userFeedback.progress(`Verifying mount point: ${normalizedPath}`, config);
     await executeCommand("mountpoint", ["-q", normalizedPath], { signal: abortController.signal });
     userFeedback.info(`Verified mount point: ${normalizedPath}`, config);
-  } catch (_error) {
-    userFeedback.warning(`Mount point ${normalizedPath} not active, attempting mount...`, config);
-    
+  } catch (mountError) {
+    // If that fails, try device-based mount
     try {
-      // First try filesystem-based mount
-      await executeCommand("mount", [normalizedPath], { signal: abortController.signal });
-      userFeedback.success(`Successfully mounted ${normalizedPath}`, config);
-    } catch (mountError) {
-      // If that fails, try device-based mount
-      try {
-        const devicePath = await findMatchingDevice(normalizedPath);
-        await executeCommand("mount", [devicePath, normalizedPath], { signal: abortController.signal });
-        userFeedback.success(`Mounted device ${devicePath} to ${normalizedPath}`, config);
-      } catch (deviceError) {
-        throw new BackupError(`Mount operation failed for ${normalizedPath}`, "EMOUNT", {
-          cause: deviceError,
-          context: {
-            path: normalizedPath,
-            suggestions: [
-              "Check if storage device is connected",
-              "Verify /etc/fstab entries",
-              "Test manual mount: 'sudo mount <device> ${normalizedPath}'"
-            ]
-          }
-        });
-      }
-    }
-
-    // Verify mount after successful attempt
-    try {
-      await executeCommand("mountpoint", ["-q", normalizedPath], { signal: abortController.signal });
-    } catch (verifyError) {
-      throw new BackupError("Mount verification failed after successful mount", "EMOUNT", {
-        cause: verifyError,
+      const devicePath = config.devicePath || await findMatchingDevice(normalizedPath);
+      await executeCommand("mount", [devicePath, normalizedPath], { signal: abortController.signal });
+      userFeedback.success(`Mounted device ${devicePath} to ${normalizedPath}`, config);
+    } catch (deviceError) {
+      throw new BackupError(`Mount operation failed for ${normalizedPath}`, "EMOUNT", {
+        cause: new AggregateError([mountError, deviceError], "Multiple mount attempts failed"),
         context: {
           path: normalizedPath,
+          attempts: [
+            `Filesystem mount error: ${mountError instanceof Error ? mountError.message : String(mountError)}`,
+            `Device mount error: ${deviceError instanceof Error ? deviceError.message : String(deviceError)}`
+          ],
           suggestions: [
-            "Check filesystem consistency",
-            "Verify kernel support for filesystem type"
+            "Check if storage device is connected",
+            "Verify /etc/fstab entries",
+            "Test manual mount: 'sudo mount <device> ${normalizedPath}'"
           ]
         }
       });
@@ -1614,12 +1580,18 @@ async function ensureMounted(mountPath: string, config: AppConfig): Promise<void
   }
 }
 
+interface BlockDevice {
+  name: string;
+  mountpoint: string | null;
+  children?: BlockDevice[];
+}
+
 const findMatchingDevice = async (mountPath: string): Promise<string> => {
   try {
     const lsblk = await executeCommand("lsblk", ["-J", "-o", "NAME,MOUNTPOINT"]);
-    const devices = JSON.parse(new TextDecoder().decode(lsblk.output));
+    const devices: { blockdevices: BlockDevice[] } = JSON.parse(new TextDecoder().decode(lsblk.output));
     
-    const matchingDevice = devices.blockdevices.find((device: any) => 
+    const matchingDevice = devices.blockdevices.find((device: BlockDevice) => 
       device.mountpoint === path.normalize(mountPath)
     );
 
