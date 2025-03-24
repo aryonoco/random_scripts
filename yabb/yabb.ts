@@ -139,7 +139,11 @@ class BackupError extends Error {
   ) {
     super(message, options);
     this.name = this.constructor.name;
-    this.context = options?.context;
+    this.context = {
+      pid: Deno.pid,
+      timestamp: new Date().toISOString(),
+      ...options?.context
+    };
   }
 
   toJSON() {
@@ -649,6 +653,21 @@ const executePipeline = async (
     // Execute pipeline
     await pipeline.pipeTo(abortableWriter, { 
       signal: abortController.signal 
+    }).catch(error => {
+      if (error instanceof Deno.errors.BadResource) {
+        throw new PipelineError("Stream resource error - possible premature closure", {
+          commands,
+          statuses: [],
+          stderrs: [],
+          cause: error,
+          suggestions: [
+            "Check storage device stability",
+            "Verify network connection if using remote storage",
+            "Retry with --no-progress flag"
+          ]
+        });
+      }
+      throw error;
     });
 
     // Check command statuses after pipeline completes
@@ -1217,8 +1236,8 @@ const performIncrementalBackup = async (parentSnap: string, showProgress: boolea
   userFeedback.progress(`Starting incremental backup from ${parentSnap}`, config);
 
   // Explicitly construct paths to preserve colons
-  const parentPath = `${config.snapDir}/${parentSnap}`;
-  const destParentPath = `${config.destMount}/${parentSnap}`;
+  const parentPath = path.join(config.snapDir, parentSnap);
+  const destParentPath = path.join(config.destMount, parentSnap);
   
   // Add explicit colon preservation verification
   const validatePathFormat = (p: string) => {
@@ -1405,11 +1424,9 @@ const cleanup = async (): Promise<void> => {
         if (sourceExists) {
           console.warn(`[Cleanup] Removing source snapshot: ${sourceSnapPath}`);
           try {
-            const result = await executeCommand("btrfs", ["subvolume", "delete", sourceSnapPath], {})
-              .catch(e => {
-                console.error(`[Cleanup] Execute error: ${e instanceof Error ? e.message : String(e)}`);
-                return { success: false, output: new Uint8Array() };
-              });
+            const result = await executeCommand("btrfs", ["subvolume", "delete", "--commit-after", sourceSnapPath], {
+              signal: AbortSignal.timeout(5000)
+            });
             console.warn(`[Cleanup] Source removal ${result.success ? 'succeeded' : 'failed'}`);
           } catch (error) {
             console.error(`[Cleanup] Source removal error caught: ${error instanceof Error ? error.message : String(error)}`);
@@ -1430,11 +1447,9 @@ const cleanup = async (): Promise<void> => {
         if (destExists) {
           console.warn(`[Cleanup] Removing destination snapshot: ${destSnapPath}`);
           try {
-            const result = await executeCommand("btrfs", ["subvolume", "delete", destSnapPath], {})
-              .catch(e => {
-                console.error(`[Cleanup] Execute error: ${e instanceof Error ? e.message : String(e)}`);
-                return { success: false, output: new Uint8Array() };
-              });
+            const result = await executeCommand("btrfs", ["subvolume", "delete", "--commit-after", destSnapPath], {
+              signal: AbortSignal.timeout(5000)
+            });
             console.warn(`[Cleanup] Destination removal ${result.success ? 'succeeded' : 'failed'}`);
           } catch (error) {
             console.error(`[Cleanup] Destination removal error caught: ${error instanceof Error ? error.message : String(error)}`);
@@ -1466,11 +1481,9 @@ const cleanup = async (): Promise<void> => {
             if (sourceExists) {
               console.warn(`[Cleanup] Removing orphaned source snapshot: ${sourceSnapPath}`);
               try {
-                const result = await executeCommand("btrfs", ["subvolume", "delete", sourceSnapPath], {})
-                  .catch(e => {
-                    console.error(`[Cleanup] Execute error: ${e instanceof Error ? e.message : String(e)}`);
-                    return { success: false, output: new Uint8Array() };
-                  });
+                const result = await executeCommand("btrfs", ["subvolume", "delete", "--commit-after", sourceSnapPath], {
+                  signal: AbortSignal.timeout(5000)
+                });
                 console.warn(`[Cleanup] Orphan source removal ${result.success ? 'succeeded' : 'failed'}`);
               } catch (error) {
                 console.error(`[Cleanup] Orphan source removal error: ${error instanceof Error ? error.message : String(error)}`);
@@ -1491,11 +1504,9 @@ const cleanup = async (): Promise<void> => {
             if (destExists) {
               console.warn(`[Cleanup] Removing orphaned destination snapshot: ${destSnapPath}`);
               try {
-                const result = await executeCommand("btrfs", ["subvolume", "delete", destSnapPath], {})
-                  .catch(e => {
-                    console.error(`[Cleanup] Execute error: ${e instanceof Error ? e.message : String(e)}`);
-                    return { success: false, output: new Uint8Array() };
-                  });
+                const result = await executeCommand("btrfs", ["subvolume", "delete", "--commit-after", destSnapPath], {
+                  signal: AbortSignal.timeout(5000)
+                });
                 console.warn(`[Cleanup] Orphan destination removal ${result.success ? 'succeeded' : 'failed'}`);
               } catch (error) {
                 console.error(`[Cleanup] Orphan destination removal error: ${error instanceof Error ? error.message : String(error)}`);
