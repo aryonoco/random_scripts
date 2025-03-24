@@ -1071,6 +1071,8 @@ const checkDestinationSpace = async (requiredBytes: number, config: AppConfig): 
 const createSnapshot = async (): Promise<void> => {
   const snapName = getSnapName();
   const snapPath = path.join(config.snapDir, snapName);
+  const state = BackupState.getInstance(); // Get state BEFORE retries
+  
   try {
     await retryOperation(async () => {
       await executeCommand("btrfs", [
@@ -1078,16 +1080,18 @@ const createSnapshot = async (): Promise<void> => {
         config.sourceVol, 
         snapPath
       ], { signal: abortController.signal });
-      
-      const state = BackupState.getInstance();
-      state.with({ 
-        snapshotCreated: true,
-        snapshotName: snapName
-      });
     }, 3, 5000);
+
+    // Update state AFTER successful retry loop
+    state.with({ 
+      snapshotCreated: true,
+      snapshotName: snapName
+    });
     
     userFeedback.success(`Created snapshot ${snapPath}`, parseConfig());
   } catch (error) {
+    // Clear state if snapshot creation ultimately failed
+    state.with({ snapshotCreated: false, snapshotName: "" });
     throw new BackupError("Snapshot creation failed", "ESNAPSHOT", {
       cause: error,
       context: { path: snapPath }
