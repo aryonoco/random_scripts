@@ -1572,7 +1572,7 @@ async function ensureMounted(mountPath: string, config: AppConfig): Promise<void
           suggestions: [
             "Check if storage device is connected",
             "Verify /etc/fstab entries",
-            "Test manual mount: 'sudo mount <device> ${normalizedPath}'"
+            `Test manual mount: 'sudo mount <device> ${normalizedPath}'`
           ]
         }
       });
