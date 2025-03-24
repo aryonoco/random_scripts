@@ -863,9 +863,9 @@ const createProgressBar = (percent: number): string => {
 const getSnapName = (): string => {
   const now = new Date();
   const pad = (n: number) => n.toString().padStart(2, '0');
-  const isoString = `${now.getUTCFullYear()}-${pad(now.getUTCMonth()+1)}-${pad(now.getUTCDate())}T` +
-                    `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())}Z`;
-  return `${path.basename(config.sourceVol)}.${isoString}`;
+  return `${path.basename(config.sourceVol)}.${now.getUTCFullYear()}-` +
+    `${pad(now.getUTCMonth()+1)}-${pad(now.getUTCDate())}T` +
+    `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())}Z`;
 };
 
 const removeSnapshot = async (
