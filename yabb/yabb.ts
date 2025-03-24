@@ -226,6 +226,7 @@ class BackupState {
   private constructor(
     public snapshotCreated = false,
     public backupSuccessful = false,
+    public snapshotName = "",
     public readonly srcUuid = "",
     public readonly destUuid = "",
     public readonly tempDir?: string,
@@ -240,6 +241,7 @@ class BackupState {
     const newState = new BackupState(
       values.snapshotCreated ?? this.snapshotCreated,
       values.backupSuccessful ?? this.backupSuccessful,
+      values.snapshotName ?? this.snapshotName,
       values.srcUuid ?? this.srcUuid,
       values.destUuid ?? this.destUuid,
       values.tempDir ?? this.tempDir,
@@ -259,6 +261,7 @@ class BackupState {
     const newState = new BackupState(
       this.instance?.snapshotCreated ?? false,
       this.instance?.backupSuccessful ?? false,
+      this.instance?.snapshotName ?? "",
       this.instance?.srcUuid ?? "",
       this.instance?.destUuid ?? "",
       tempDir,
@@ -1071,13 +1074,21 @@ const checkDestinationSpace = async (requiredBytes: number, config: AppConfig): 
 };
 
 const createSnapshot = async (): Promise<void> => {
-  const snapPath = path.join(config.snapDir, getSnapName());
+  const snapName = getSnapName();
+  const snapPath = path.join(config.snapDir, snapName);
   try {
     await executeCommand("btrfs", [
       "subvolume", "snapshot", "-r", 
       config.sourceVol, 
       snapPath
     ], { signal: abortController.signal });
+    
+    const state = BackupState.getInstance();
+    state.with({ 
+      snapshotCreated: true,
+      snapshotName: snapName
+    });
+    
     userFeedback.success(`Created snapshot ${snapPath}`, parseConfig());
   } catch (error) {
     throw new BackupError("Snapshot creation failed", "ESNAPSHOT", {
@@ -1399,63 +1410,30 @@ const withLock = async <T>(
 
 // ==================== Updated Cleanup Process ====================
 const cleanup = async (): Promise<void> => {
-  // Remove signal listeners first
-  Deno.removeSignalListener("SIGINT", signalHandlers.SIGINT);
-  Deno.removeSignalListener("SIGTERM", signalHandlers.SIGTERM);
-  Deno.removeSignalListener("SIGHUP", signalHandlers.SIGHUP);
-  
   const state = BackupState.getInstance();
   
   try {
-    if (state.snapshotCreated && !state.backupSuccessful) {
-      await Promise.allSettled([
-        retryOperation(
-          (signal) => removeSnapshot(config.snapDir, signal), 
-          3, 
-          1000
-        ),
-        retryOperation(
-          (signal) => removeSnapshot(config.destMount, signal), 
-          3, 
-          1000
-        )
-      ]);
-    }
-
-    // Secure temp file cleanup
-    if (state.tempDir || state.tempPathFile) {
-      userFeedback.progress("Cleaning temporary resources...", parseConfig());
-      const cleanupOps = [];
+    if (state.snapshotCreated && !state.backupSuccessful && state.snapshotName) {
+      userFeedback.info("Cleaning up failed backup artifacts", parseConfig());
       
-      if (state.tempPathFile) {
-        cleanupOps.push(
-          Deno.remove(state.tempPathFile).catch(e => {
-            throw new BackupError("Failed to remove temporary file", "ETEMP", {
-              cause: e
-            });
-          })
-        );
-      }
-      
-      if (state.tempDir) {
-        cleanupOps.push(
-          abortable(
-            Deno.remove(state.tempDir, { recursive: true }),
-            abortController.signal
-          ).catch((e: unknown) => {
-            if (e instanceof DOMException && e.name === "AbortError") return;
-            throw new BackupError("Failed to remove temp dir", "ETEMP", { cause: e });
-          })
+      // Delete source snapshot using stored name
+      const sourceSnapPath = path.join(config.snapDir, state.snapshotName);
+      if (await exists(sourceSnapPath)) {
+        await retryOperation(
+          (signal) => executeCommand("btrfs", ["subvolume", "delete", sourceSnapPath], { signal }),
+          3,
+          1000
         );
       }
 
-      const results = await Promise.allSettled(cleanupOps);
-      for (const result of results) {
-        if (result.status === "rejected") {
-          const error = result.reason;
-          if (error instanceof BackupError) throw error;
-          throw new BackupError("Cleanup failed", "ETEMP", { cause: error });
-        }
+      // Delete destination snapshot if partially created
+      const destSnapPath = path.join(config.destMount, state.snapshotName);
+      if (await exists(destSnapPath)) {
+        await retryOperation(
+          (signal) => executeCommand("btrfs", ["subvolume", "delete", destSnapPath], { signal }),
+          3,
+          1000
+        );
       }
     }
   } catch (error) {
