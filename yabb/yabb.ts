@@ -871,15 +871,6 @@ const getSnapName = (): string => {
     `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())}Z`;
 };
 
-const removeSnapshot = async (
-  basePath: string,
-  snapName: string,
-  signal?: AbortSignal
-): Promise<void> => {
-  const snapPath = path.join(basePath, snapName);
-  await executeCommand("btrfs", ["subvolume", "delete", snapPath], { signal });
-};
-
 const estimateDeltaSize = async (
   parentPath: string,
   currentPath: string
@@ -1172,8 +1163,8 @@ const verifySubvolumeUuid = async (path: string): Promise<string> => {
     const showOutput = await executeCommand("btrfs", ["subvolume", "show", path], { signal: abortController.signal });
     const output = new TextDecoder().decode(showOutput.output);
     
-    // Match source UUID pattern
-    const uuidMatch = output.match(/UUID:\s+([0-9a-f-]{36})/i);
+    // Match more flexibly, similar to shell script's grep
+    const uuidMatch = output.match(/\buuid:[ \t]+([0-9a-f-]{36})/i);
     if (!uuidMatch) throw new UuidMismatchError("Failed to parse source subvolume UUID", {
       cause: new Error("UUID pattern not found in subvolume output"),
       context: { path, outputSnippet: output.slice(0, 200) }
@@ -1193,7 +1184,8 @@ const verifyReceivedUuid = async (subvolPath: string): Promise<string> => {
     const showOutput = await executeCommand("btrfs", ["subvolume", "show", subvolPath], { signal: abortController.signal });
     const output = new TextDecoder().decode(showOutput.output);
     
-    const receivedUuidMatch = output.match(/Received\s+UUID:\s+([0-9a-f-]{36})/i);
+    // Match more flexibly, similar to shell script's grep
+    const receivedUuidMatch = output.match(/received[ \t]+uuid:[ \t]+([0-9a-f-]{36})/i);
     if (!receivedUuidMatch) throw new UuidMismatchError("No received UUID found in destination snapshot", {
       cause: new Error("Received UUID pattern not found in destination output"),
       context: { 
@@ -1438,35 +1430,53 @@ const withLock = async <T>(
 // ==================== Updated Cleanup Process ====================
 const cleanup = async (): Promise<void> => {
   const state = BackupState.getInstance();
+  const appConfig = parseConfig(); // Local configuration for user feedback
   
   try {
+    logger.info(`Cleanup state check: snapshotCreated=${state.snapshotCreated}, backupSuccessful=${state.backupSuccessful}, snapshotName=${state.snapshotName}`);
+    
     if (state.snapshotCreated && !state.backupSuccessful && state.snapshotName) {
-      userFeedback.info("Cleaning up failed backup artifacts", parseConfig());
+      userFeedback.info("Cleaning up failed backup artifacts", appConfig);
       
-      // Use the improved removeSnapshot
-      await retryOperation(
-        (signal) => removeSnapshot(config.snapDir, state.snapshotName, signal), 
-        3, 
-        1000
-      );
+      // First check if source snapshot exists before trying to delete it
+      const sourcePath = path.join(config.snapDir, state.snapshotName);
+      if (await exists(sourcePath)) {
+        userFeedback.info(`Removing source snapshot: ${sourcePath}`, appConfig);
+        await retryOperation(
+          (signal) => removeSnapshot(config.snapDir, state.snapshotName, signal),
+          3,
+          1000
+        );
+      } else {
+        logger.info(`Source snapshot does not exist: ${sourcePath}`);
+      }
       
-      await retryOperation(
-        (signal) => removeSnapshot(config.destMount, state.snapshotName, signal),
-        3,
-        1000
-      );
+      // Then check destination snapshot
+      const destPath = path.join(config.destMount, state.snapshotName);
+      if (await exists(destPath)) {
+        userFeedback.info(`Removing destination snapshot: ${destPath}`, appConfig);
+        await retryOperation(
+          (signal) => removeSnapshot(config.destMount, state.snapshotName, signal),
+          3,
+          1000
+        );
+      } else {
+        logger.info(`Destination snapshot does not exist: ${destPath}`);
+      }
     }
   } catch (error) {
-    const formatter = new ErrorFormatter(parseConfig());
+    const formatter = new ErrorFormatter(appConfig);
     logger.error("Cleanup failed:\n" + formatter.format(error));
   }
   
+  // Use the global config object for the lock file path
   try {
-    await Deno.remove(config.lockFile);
-  } catch (error) {
-    if (!(error instanceof Deno.errors.NotFound)) {
-      console.error("Failed to clean up lock file:", error);
+    if (await exists(config.lockFile)) {
+      await Deno.remove(config.lockFile);
+      logger.info("Lock file removed successfully");
     }
+  } catch (error) {
+    logger.error(`Failed to clean up lock file: ${error instanceof Error ? error.message : String(error)}`);
   }
 };
 
@@ -1499,32 +1509,22 @@ const parseTransactionIdFromPath = async (subvolPath: string): Promise<number> =
   const output = new TextDecoder().decode(showOutput.output);
 
   try {
-    const parsed = parse(output, {
-      delimiter: ":",
-      columns: ["key", "value"],
-      trimLeadingSpace: true,
-      comment: "#"
-    });
-
-    const tidRow = parsed.find(row => 
-      row.key.toLowerCase().includes("transid") || 
-      row.key.toLowerCase().includes("transaction id")
-    );
-
-    if (!tidRow?.value) {
+    // Use regex pattern similar to shell script instead of CSV parsing
+    const transIdMatch = output.match(/(transid marker was|transaction id):\s+(\d+)/i);
+    
+    if (!transIdMatch || !transIdMatch[2]) {
       throw new BackupError("Transaction ID not found", "ETRANSID", {
         context: {
           outputSnippet: output.slice(0, 200),
-          parsedFields: parsed.map(r => r.key),
           suggestions: ["Check btrfs subvolume show output format"]
         }
       });
     }
 
-    const tid = parseInt(tidRow.value.trim(), 10);
+    const tid = parseInt(transIdMatch[2], 10);
     if (isNaN(tid)) {
       throw new BackupError("Invalid transaction ID format", "ETRANSID", {
-        context: { parsedValue: tidRow.value }
+        context: { parsedValue: transIdMatch[2] }
       });
     }
 
@@ -1650,6 +1650,7 @@ const findMatchingDevice = async (mountPath: string): Promise<string> => {
 const main = async () => {
   setup(LOG_CONFIG);
   const config = parseConfig();
+  const state = BackupState.getInstance();
 
   // Register signal handlers when execution starts
   Deno.addSignalListener("SIGINT", signalHandlers.SIGINT);
@@ -1659,8 +1660,6 @@ const main = async () => {
   try {
     // Direct locking without separate verification
     await withLock(async () => {
-      const state = BackupState.getInstance();
-      
       logger.info("Starting backup process");
       try {
         await verifyDependencies();
@@ -1675,7 +1674,7 @@ const main = async () => {
         // Create new snapshot
         logger.info("Creating new snapshot...");
         await createSnapshot();
-        state.with({ snapshotCreated: true });
+        // state.snapshotCreated is set to true in createSnapshot()
 
         // Determine backup type
         const parentSnap = await findParentSnapshot();
@@ -1690,16 +1689,19 @@ const main = async () => {
           await performIncrementalBackup(parentSnap, config.showProgress);
         }
 
-        // Update success state
+        // Only mark as successful if we get here
         state.with({ backupSuccessful: true });
         logger.info("Backup completed successfully");
       } catch (error) {
+        // Explicitly ensure backupSuccessful is false
+        state.with({ backupSuccessful: false });
         const errMsg = error instanceof Error ? error.message : String(error);
         logger.error("Backup failed:", errMsg);
         throw error;
       }
     });
   } catch (error) {
+    // Always run cleanup regardless of error
     await cleanup();
     const formatter = new ErrorFormatter(parseConfig());
     logger.error("Backup process failed with error:\n" + formatter.format(error));
