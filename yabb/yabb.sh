@@ -13,12 +13,13 @@ fi
 
 # Run Deno with all required permissions and flags
 exec deno run \
-  --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test \
-  --allow-read=/data,/mnt/external,/var/lock,/usr/bin,/etc/mtab \
-  --allow-write=/data/.snapshots,/mnt/external,/var/lock \
-  --allow-env=TZ \
-  --allow-net=jsr.io \
+  --allow-run=btrfs,mount,mountpoint,find,pv,du,which,test,lsblk,blkid \
+  --allow-read=/data,/mnt/external,/var/lock,/usr/bin,/etc/mtab,/dev,/proc,/sys \
+  --allow-write=/data/.snapshots,/mnt/external,/var/lock,/tmp \
+  --allow-env=TZ,HOME,USER \
+  --allow-net=jsr.io,registry.npmjs.org,cdn.jsdelivr.net \
   --allow-sys \
-  --unstable-kv \
-  --v8-flags="--max-old-space-size=256,--jitless,--optimize-for-size,--use-ic,--no-concurrent-recompilation,--enable-ssse3,--enable-sse4-1,--enable-sse4-2" \
-  --no-check "$TS_FILE" "$@"
+  --allow-ffi \
+  --no-check \
+  --no-prompt \
+  "$TS_FILE" "$@"
