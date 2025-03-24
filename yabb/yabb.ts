@@ -6,7 +6,7 @@
 import { retry } from "jsr:@std/async/retry";
 import { deadline } from "jsr:@std/async";
 
-import { ensureFile, exists, expandGlob } from "jsr:@std/fs";
+import { ensureFile, exists} from "jsr:@std/fs";
 
 import * as path from "jsr:@std/path";
 
@@ -1097,33 +1097,48 @@ const createSnapshot = async (): Promise<void> => {
 
 const findParentSnapshot = async (): Promise<string | null> => {
   try {
-    const pattern = `${path.basename(config.sourceVol)}.*`;
-    const options = {
-      root: config.snapDir,
-      maxDepth: 1,
-      includeDirs: true,
-      extended: true,
-    };
-
-    const snapshots: Array<{ path: string; mtime: Date }> = [];
-    for await (const entry of expandGlob(pattern, options)) {
-      if (!entry.isDirectory || entry.name === getSnapName()) continue;
+    const currentSnap = getSnapName();
+    const sourceBaseName = path.basename(config.sourceVol);
+    
+    // Get all snapshots and their stats
+    const snapshots: Array<{ name: string; mtime: number }> = [];
+    for await (const entry of Deno.readDir(config.snapDir)) {
+      // Only consider directories matching our pattern
+      if (!entry.isDirectory || !entry.name.startsWith(sourceBaseName)) {
+        continue;
+      }
       
-      const info = await Deno.stat(entry.path);
-      const mtime = info.mtime ?? new Date(0);
-      snapshots.push({ path: entry.path, mtime });
+      // Skip the current snapshot we just created
+      if (entry.name === currentSnap) {
+        continue;
+      }
+      
+      const stat = await Deno.stat(path.join(config.snapDir, entry.name));
+      if (stat.mtime) {
+        snapshots.push({ 
+          name: entry.name, 
+          mtime: stat.mtime.getTime() 
+        });
+      }
     }
-
-    // Sort by mtime descending, using numeric timestamp for comparison
-    snapshots.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
-
-    return snapshots.length > 0 ? path.basename(snapshots[0].path) : null;
+    
+    // No snapshots found
+    if (snapshots.length === 0) {
+      logger.info("No existing snapshots found in " + config.snapDir);
+      return null;
+    }
+    
+    // Sort by modification time, newest first
+    snapshots.sort((a, b) => b.mtime - a.mtime);
+    
+    logger.info(`Found previous snapshots, selecting newest: ${snapshots[0].name}`);
+    return snapshots[0].name;
   } catch (error) {
     throw new BackupError("Failed to find parent snapshot", "ESNAPSHOT", {
       cause: error,
       context: {
         snapDir: config.snapDir,
-        pattern: `${path.basename(config.sourceVol)}.*`,
+        sourceBaseName: path.basename(config.sourceVol),
         suggestions: ["Verify snapshot directory structure"]
       }
     });
