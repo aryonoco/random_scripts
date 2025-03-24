@@ -1638,7 +1638,7 @@ const main = async () => {
     const formattedError = error instanceof Error 
       ? error.message 
       : `Non-Error exception: ${String(error)}`;
-    logger.error(formattedError, parseConfig(), "CRITICAL" as LevelName);
+    logger.error(formattedError);
     Deno.exit(1);
   }
 };
@@ -1650,6 +1650,6 @@ main().catch(error => {
   const formattedError = error instanceof Error 
     ? formatter.format(error) 
     : `Non-Error exception: ${String(error)}`;
-  logger.error(formattedError, parseConfig(), "CRITICAL" as LevelName);
+  logger.error(formattedError);
   Deno.exit(1);
 });
