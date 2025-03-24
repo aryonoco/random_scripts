@@ -224,8 +224,8 @@ class PipelineError extends BackupError {
 class BackupState {
   private static instance: BackupState;
   private constructor(
-    public readonly snapshotCreated = false,
-    public readonly backupSuccessful = false,
+    public snapshotCreated = false,
+    public backupSuccessful = false,
     public readonly srcUuid = "",
     public readonly destUuid = "",
     public readonly tempDir?: string,
@@ -237,7 +237,7 @@ class BackupState {
   }
 
   with(values: Partial<BackupState>): BackupState {
-    return new BackupState(
+    const newState = new BackupState(
       values.snapshotCreated ?? this.snapshotCreated,
       values.backupSuccessful ?? this.backupSuccessful,
       values.srcUuid ?? this.srcUuid,
@@ -245,6 +245,8 @@ class BackupState {
       values.tempDir ?? this.tempDir,
       values.tempPathFile ?? this.tempPathFile
     );
+    BackupState.instance = newState;
+    return newState;
   }
 
   static async createTempResources(): Promise<BackupState> {
@@ -253,7 +255,18 @@ class BackupState {
     await ensureFile(tempPathFile);
     await Deno.writeTextFile(tempPathFile, "[]");
 
-    return new BackupState(false, false, "", "", tempDir, tempPathFile);
+    // Update singleton with new temp resources
+    const newState = new BackupState(
+      this.instance?.snapshotCreated ?? false,
+      this.instance?.backupSuccessful ?? false,
+      this.instance?.srcUuid ?? "",
+      this.instance?.destUuid ?? "",
+      tempDir,
+      tempPathFile
+    );
+    
+    BackupState.instance = newState;
+    return newState;
   }
 }
 
@@ -847,8 +860,13 @@ const createProgressBar = (percent: number): string => {
 };
 
 // ==================== Updated Backup Operations ====================
-const getSnapName = (): string => 
-  `${path.basename(config.sourceVol)}.${new Date().toISOString()}`;
+const getSnapName = (): string => {
+  const now = new Date();
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const isoString = `${now.getUTCFullYear()}-${pad(now.getUTCMonth()+1)}-${pad(now.getUTCDate())}T` +
+                    `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())}Z`;
+  return `${path.basename(config.sourceVol)}.${isoString}`;
+};
 
 const removeSnapshot = async (
   basePath: string,
@@ -1071,7 +1089,7 @@ const createSnapshot = async (): Promise<void> => {
 
 const findParentSnapshot = async (): Promise<string | null> => {
   try {
-    const pattern = `${path.basename(config.sourceVol)}.*`;
+    const pattern = `${path.basename(config.sourceVol)}.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z`;
     const options = {
       root: config.snapDir,
       maxDepth: 1,
@@ -1097,7 +1115,7 @@ const findParentSnapshot = async (): Promise<string | null> => {
       cause: error,
       context: {
         snapDir: config.snapDir,
-        pattern: `${path.basename(config.sourceVol)}.*`,
+        pattern: `${path.basename(config.sourceVol)}.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z`,
         suggestions: ["Verify snapshot directory structure"]
       }
     });
@@ -1639,7 +1657,7 @@ const main = async () => {
         // Create new snapshot
         logger.info("Creating new snapshot...");
         await createSnapshot();
-        const newState = state.with({ snapshotCreated: true });
+        state.with({ snapshotCreated: true });
 
         // Determine backup type
         const parentSnap = await findParentSnapshot();
@@ -1655,7 +1673,7 @@ const main = async () => {
         }
 
         // Update success state
-        newState.with({ backupSuccessful: true });
+        state.with({ backupSuccessful: true });
         logger.info("Backup completed successfully");
       } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
