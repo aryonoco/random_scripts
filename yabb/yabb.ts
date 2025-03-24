@@ -960,25 +960,25 @@ const estimateDeltaSize = async (
 const userFeedback = {
   info: (message: string, config: AppConfig) => {
     const logger = getLogger();
-    logger.info(config.colorOutput ? Color.cyan(message) : message, config);
+    logger.info(config.colorOutput ? Color.cyan(message) : message);
   },
   warning: (message: string, config: AppConfig) => {
     const logger = getLogger();
-    logger.warn(config.colorOutput ? Color.yellow(message) : message, config);
+    logger.warn(config.colorOutput ? Color.yellow(message) : message);
   },
   success: (message: string, config: AppConfig) => {
     const logger = getLogger();
-    logger.info(config.colorOutput ? Color.green(message) : message, config, "SUCCESS" as LevelName);
+    logger.info(config.colorOutput ? Color.green(message) : message);
   },
   progress: (message: string, config: AppConfig) => {
     if (config.showProgress && !config.jsonOutput) {
       const logger = getLogger();
-      logger.info(message, config, "PROGRESS" as LevelName);
+      logger.info(message);
     }
   },
   error: (message: string, config: AppConfig) => {
     const logger = getLogger();
-    logger.error(config.colorOutput ? Color.red(message) : message, config, "CRITICAL" as LevelName);
+    logger.error(config.colorOutput ? Color.red(message) : message);
   }
 };
 
