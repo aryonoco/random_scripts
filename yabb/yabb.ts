@@ -95,6 +95,7 @@ interface AppConfig {
   readonly destMount: string;
   readonly snapDir: string;
   readonly sourceVol: string;
+  readonly devicePath?: string;
 }
 
 interface RetryContext extends ErrorContext {
@@ -1528,7 +1529,10 @@ const parseConfig = (): AppConfig => ({
   showProgress: Deno.stdout.isTerminal() && !Deno.args.includes("--no-progress"),
   destMount: path.normalize(config.destMount),
   snapDir: path.normalize(config.snapDir),
-  sourceVol: path.normalize(config.sourceVol)
+  sourceVol: path.normalize(config.sourceVol),
+  devicePath: Deno.args.includes("--device") 
+    ? Deno.args[Deno.args.indexOf("--device") + 1]
+    : undefined
 });
 
 const extractUuidFromOutput = (output: Uint8Array): string | null => {
@@ -1537,34 +1541,110 @@ const extractUuidFromOutput = (output: Uint8Array): string | null => {
 };
 
 // ==================== Updated Mount Operations ====================
-async function ensureMounted(path: string, config: AppConfig): Promise<void> {
+async function ensureMounted(mountPath: string, config: AppConfig): Promise<void> {
+  const normalizedPath = path.normalize(mountPath);
+  
   try {
-    await verifyMountPoint(path);
-    userFeedback.info(`Verified mount point: ${path}`, config);
+    // First ensure mount point directory exists
+    try {
+      await Deno.mkdir(normalizedPath, { recursive: true });
+      userFeedback.info(`Created mount point directory: ${normalizedPath}`, config);
+    } catch (error) {
+      if (!(error instanceof Deno.errors.AlreadyExists)) {
+        throw new BackupError("Failed to create mount directory", "EMOUNT", {
+          cause: error,
+          context: {
+            path: normalizedPath,
+            suggestions: [
+              "Check filesystem permissions",
+              "Verify parent directory exists"
+            ]
+          }
+        });
+      }
+    }
+
+    // Then verify if already mounted
+    userFeedback.progress(`Verifying mount point: ${normalizedPath}`, config);
+    await executeCommand("mountpoint", ["-q", normalizedPath], { signal: abortController.signal });
+    userFeedback.info(`Verified mount point: ${normalizedPath}`, config);
   } catch (_error) {
-    userFeedback.warning(`Mount point ${path} not active, attempting mount...`, config);
+    userFeedback.warning(`Mount point ${normalizedPath} not active, attempting mount...`, config);
     
     try {
-      await executeCommand("mount", [path], { signal: abortController.signal });
-      userFeedback.success(`Successfully mounted ${path}`, config);
-      
-      // Verify mount after successful attempt
-      await verifyMountPoint(path);
+      // First try filesystem-based mount
+      await executeCommand("mount", [normalizedPath], { signal: abortController.signal });
+      userFeedback.success(`Successfully mounted ${normalizedPath}`, config);
     } catch (mountError) {
-      throw new BackupError(`Mount operation failed for ${path}`, "EMOUNT", {
-        cause: mountError,
+      // If that fails, try device-based mount
+      try {
+        const devicePath = await findMatchingDevice(normalizedPath);
+        await executeCommand("mount", [devicePath, normalizedPath], { signal: abortController.signal });
+        userFeedback.success(`Mounted device ${devicePath} to ${normalizedPath}`, config);
+      } catch (deviceError) {
+        throw new BackupError(`Mount operation failed for ${normalizedPath}`, "EMOUNT", {
+          cause: deviceError,
+          context: {
+            path: normalizedPath,
+            suggestions: [
+              "Check if storage device is connected",
+              "Verify /etc/fstab entries",
+              "Test manual mount: 'sudo mount <device> ${normalizedPath}'"
+            ]
+          }
+        });
+      }
+    }
+
+    // Verify mount after successful attempt
+    try {
+      await executeCommand("mountpoint", ["-q", normalizedPath], { signal: abortController.signal });
+    } catch (verifyError) {
+      throw new BackupError("Mount verification failed after successful mount", "EMOUNT", {
+        cause: verifyError,
         context: {
-          path,
+          path: normalizedPath,
           suggestions: [
-            "Check /etc/fstab entries",
-            "Verify filesystem integrity",
-            "Ensure proper permissions"
+            "Check filesystem consistency",
+            "Verify kernel support for filesystem type"
           ]
         }
       });
     }
   }
 }
+
+const findMatchingDevice = async (mountPath: string): Promise<string> => {
+  try {
+    const lsblk = await executeCommand("lsblk", ["-J", "-o", "NAME,MOUNTPOINT"]);
+    const devices = JSON.parse(new TextDecoder().decode(lsblk.output));
+    
+    const matchingDevice = devices.blockdevices.find((device: any) => 
+      device.mountpoint === path.normalize(mountPath)
+    );
+
+    if (matchingDevice) return `/dev/${matchingDevice.name}`;
+
+    // Check filesystem labels
+    const blkid = await executeCommand("blkid", ["-L", path.basename(mountPath)]);
+    const labelOutput = new TextDecoder().decode(blkid.output);
+    const labelDevice = labelOutput.split("\n")[0];
+    if (labelDevice) return labelDevice;
+
+    throw new Error("No matching device found");
+  } catch (error) {
+    throw new BackupError("Failed to find storage device", "EMOUNT", {
+      cause: error,
+      context: {
+        mountPath,
+        suggestions: [
+          "Connect storage device and try again",
+          "Specify device manually using --device option"
+        ]
+      }
+    });
+  }
+};
 
 // ==================== Modified Main Workflow ====================
 const main = async () => {
