@@ -276,6 +276,10 @@ class ErrorFormatter {
     const indent = "  ".repeat(depth);
     const lines: string[] = [];
     
+    if (!error) {
+      return `${indent}Unknown error occurred`;
+    }
+
     if (error instanceof BackupError) {
       lines.push(
         this.colorize(`${indent}${error.name} [${error.code}]`, Color.red),
@@ -1635,9 +1639,9 @@ const main = async () => {
   } catch (error) {
     await cleanup();
     const logger = getLogger();
-    const formattedError = error instanceof Error 
-      ? error.message 
-      : `Non-Error exception: ${String(error)}`;
+    const formattedError = error ? 
+      (error instanceof Error ? error.message : String(error)) : 
+      "Unknown error occurred";
     logger.error(formattedError);
     Deno.exit(1);
   }
@@ -1647,9 +1651,9 @@ const main = async () => {
 main().catch(error => {
   const logger = getLogger();
   const formatter = new ErrorFormatter(parseConfig());
-  const formattedError = error instanceof Error 
-    ? formatter.format(error) 
-    : `Non-Error exception: ${String(error)}`;
+  const formattedError = error ? 
+    (error instanceof Error ? formatter.format(error) : `Non-Error: ${Deno.inspect(error)}`) : 
+    "Unknown error occurred";
   logger.error(formattedError);
   Deno.exit(1);
 });
