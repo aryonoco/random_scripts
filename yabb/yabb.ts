@@ -1245,23 +1245,12 @@ const verifySnapshotConsistency = async (
   const config = parseConfig();
   
   try {
-    // First verify UUIDs
+    // ONLY verify UUIDs match - don't check transaction IDs
     userFeedback.progress("Verifying subvolume UUIDs...", config);
     await verifyUuidMatch(sourcePath, destPath);
-
-    // Then verify transaction IDs
-    userFeedback.progress("Verifying transaction IDs...", config);
-    const sourceTid = await parseTransactionIdFromPath(sourcePath);
-    const destTid = await parseTransactionIdFromPath(destPath);
-
-    if (sourceTid !== destTid) {
-      throw new UuidMismatchError("Transaction ID mismatch", {
-        sourceTid,
-        destTid,
-        sourcePath,
-        destPath
-      });
-    }
+    
+    // Skip transaction ID verification entirely - shell script doesn't do this
+    // The shell script only cares about UUID matching for safety
   } catch (error) {
     if (error instanceof UuidMismatchError) throw error;
     
