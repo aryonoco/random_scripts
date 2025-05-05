@@ -1,0 +1,210 @@
+#!/usr/bin/env sh
+set -eu # Exit on error and treat unset variables as errors
+
+# --- Configuration ---
+# Source Python script containing the logic
+SOURCE_PYTHON_SCRIPT_NAME="_url_cleaner.py"
+# Target executable script name (no extension)
+TARGET_EXECUTABLE_NAME="url-cleaner"
+# --- Dependencies are managed in requirements.txt ---
+REQUIREMENTS_FILE_NAME="requirements.txt"
+# Directory for the dedicated virtual environment (relative to the script)
+VENV_DIR=".venv_url_cleaner"
+# Required Python version string (major.minor)
+PYTHON_VERSION_REQ="3.13"
+# --- End Configuration ---
+
+# Get the directory where this install script resides
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+SOURCE_PYTHON_SCRIPT="${SCRIPT_DIR}/${SOURCE_PYTHON_SCRIPT_NAME}"
+TARGET_EXECUTABLE="${SCRIPT_DIR}/${TARGET_EXECUTABLE_NAME}"
+TARGET_VENV_DIR="${SCRIPT_DIR}/${VENV_DIR}"
+REQUIREMENTS_FILE="${SCRIPT_DIR}/${REQUIREMENTS_FILE_NAME}" # Path to requirements file
+
+# Function to detect user's shell rc file
+detect_shell_rc() {
+  case "$SHELL" in
+    *zsh*)  echo "$HOME/.zshrc" ;;
+    *fish*) echo "$HOME/.config/fish/config.fish" ;;
+    *)      echo "$HOME/.bashrc" ;; # Default to bashrc
+  esac
+}
+
+# Function to compare semantic versions (simplified for major.minor)
+version_ge() {
+    printf '%s\n%s' "$2" "$1" | sort -V -C # Returns 0 if $1 >= $2
+}
+
+# === Step 1: Check/Install uv ===
+if ! command -v uv > /dev/null 2>&1; then
+  echo "Installing uv (fast Python package installer and resolver)..."
+  if curl -LsSf https://astral.sh/uv/install.sh | sh; then
+    echo "'uv' installed successfully to $HOME/.cargo/bin or similar (check install output)."
+  else
+    echo "Error: Failed to install uv." >&2; exit 1
+  fi
+  # Determine typical install location
+  UV_INSTALL_PATH="$HOME/.cargo/bin" # Common location
+  # Add more locations if needed, e.g., $HOME/.local/bin
+  if [ ! -d "$UV_INSTALL_PATH" ]; then
+      UV_INSTALL_PATH="$HOME/.local/bin" # Alternative common location
+  fi
+
+  shell_rc=$(detect_shell_rc)
+  if [ -f "$shell_rc" ]; then
+    # Check if the exact line or a similar path definition exists
+    # Use grep -F for fixed strings, -q for quiet
+    if ! grep -Fq "export PATH=\"$UV_INSTALL_PATH:\$PATH\"" "$shell_rc" && \
+       ! grep -q "PATH.*$UV_INSTALL_PATH" "$shell_rc"; then # More general check
+        echo '' >> "$shell_rc"; echo '# Added by url-cleaner installer for uv' >> "$shell_rc"; echo "export PATH=\"$UV_INSTALL_PATH:\$PATH\"" >> "$shell_rc"
+        echo "PATH updated in $shell_rc to include $UV_INSTALL_PATH. Please restart your shell or run 'source $shell_rc'."
+    else
+      echo "$UV_INSTALL_PATH appears to be already in PATH in $shell_rc."
+    fi
+  else
+      echo "Warning: Could not find shell config ($shell_rc). Please add $UV_INSTALL_PATH to PATH manually."
+  fi
+  # Temporarily add uv to the PATH for this script's execution
+  export PATH="$UV_INSTALL_PATH:$PATH"
+  if ! command -v uv > /dev/null 2>&1; then
+     echo "Error: uv installed but still not found in PATH ($PATH) for current script execution." >&2; exit 1
+  fi
+else
+  echo "uv is already installed."
+fi
+
+# === Step 2: Check Source Python Script ===
+if [ ! -f "${SOURCE_PYTHON_SCRIPT}" ]; then
+    echo "Error: Source script ${SOURCE_PYTHON_SCRIPT_NAME} not found in ${SCRIPT_DIR}" >&2
+    exit 1
+fi
+if [ ! -r "${SOURCE_PYTHON_SCRIPT}" ]; then
+    echo "Error: Cannot read source script ${SOURCE_PYTHON_SCRIPT_NAME}" >&2
+    exit 1
+fi
+
+# === Step 3: Create Virtual Environment ===
+echo "Creating Python ${PYTHON_VERSION_REQ}+ environment in ${TARGET_VENV_DIR}..."
+# Remove existing venv to ensure clean state
+rm -rf "${TARGET_VENV_DIR}"
+# Try creating with the specific Python version first
+# Use --quiet to suppress success messages, rely on error codes
+if ! uv venv "${TARGET_VENV_DIR}" -p "${PYTHON_VERSION_REQ}" --seed --quiet > /dev/null 2>&1; then
+    echo "Warning: Could not create venv with Python ${PYTHON_VERSION_REQ}. Trying default 'python3'..."
+    if ! uv venv "${TARGET_VENV_DIR}" --seed --quiet > /dev/null 2>&1; then
+        echo "Error: Failed to create virtual environment using 'uv venv'." >&2
+        echo "Please ensure Python ${PYTHON_VERSION_REQ}+ is installed and accessible." >&2
+        echo "You might need to specify the Python interpreter path, e.g., uv venv -p /path/to/python${PYTHON_VERSION_REQ}" >&2
+        exit 1
+    else
+        echo "Created venv with default python3. Checking version..."
+        VENV_PYTHON_CHECK="${TARGET_VENV_DIR}/bin/python"
+        # Check if python exists in venv bin
+        if [ ! -x "$VENV_PYTHON_CHECK" ]; then
+            echo "Error: python executable not found in created venv: ${VENV_PYTHON_CHECK}" >&2
+            rm -rf "${TARGET_VENV_DIR}" # Clean up failed attempt
+            exit 1
+        fi
+        INSTALLED_VERSION=$($VENV_PYTHON_CHECK -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+        echo "Installed Python version: $INSTALLED_VERSION"
+        # Use version_ge function for comparison
+        if ! version_ge "$INSTALLED_VERSION" "$PYTHON_VERSION_REQ"; then
+             echo "Error: The created virtual environment uses Python $INSTALLED_VERSION, which is older than the required ${PYTHON_VERSION_REQ}." >&2
+             echo "Please install Python ${PYTHON_VERSION_REQ}+ and ensure 'uv' can find it, or specify the path using '-p'." >&2
+             rm -rf "${TARGET_VENV_DIR}" # Clean up failed attempt
+             exit 1
+        fi
+    fi
+fi
+echo "Virtual environment created successfully with Python >= ${PYTHON_VERSION_REQ}."
+VENV_PYTHON="${TARGET_VENV_DIR}/bin/python"
+if [ ! -x "${VENV_PYTHON}" ]; then
+    echo "Error: Virtual environment Python executable not found at ${VENV_PYTHON}" >&2
+    # Attempt cleanup, though it shouldn't be needed if creation succeeded
+    rm -rf "${TARGET_VENV_DIR}"
+    exit 1
+fi
+
+# === Step 4: Install Dependencies from requirements.txt ===
+echo "Checking for requirements file: ${REQUIREMENTS_FILE_NAME}"
+if [ ! -f "${REQUIREMENTS_FILE}" ]; then
+    echo "Error: Requirements file '${REQUIREMENTS_FILE_NAME}' not found in ${SCRIPT_DIR}" >&2
+    exit 1
+fi
+if [ ! -r "${REQUIREMENTS_FILE}" ]; then
+    echo "Error: Cannot read requirements file '${REQUIREMENTS_FILE_NAME}'" >&2
+    exit 1
+fi
+
+echo "Installing dependencies from ${REQUIREMENTS_FILE_NAME} using uv..."
+# Use --python flag to ensure uv uses the correct interpreter from the venv
+# Use -r to specify the requirements file
+if ! uv pip install --python "${VENV_PYTHON}" -r "${REQUIREMENTS_FILE}" --quiet; then
+    echo "Error: Failed to install dependencies using 'uv pip install -r ${REQUIREMENTS_FILE_NAME}'." >&2
+    echo "--- uv pip install output ---"
+    # Run again without --quiet to show errors
+    uv pip install --python "${VENV_PYTHON}" -r "${REQUIREMENTS_FILE}"
+    echo "---------------------------"
+    exit 1
+fi
+echo "Dependencies installed successfully."
+
+# === Step 5: Create Target Executable with Polyglot Shebang ===
+echo "Creating executable ${TARGET_EXECUTABLE_NAME}..."
+
+# --- Generate the Polyglot Shebang structure (using the working postgis pattern) ---
+# This relies on shell interpreting '''exec' ... ' correctly and python seeing '''...'''
+# The VENV_DIR variable is directly embedded here. $0 refers to the script being run.
+read -r -d '' POLYGLOT_SHEBANG <<EOF || true
+#!/bin/sh
+# Polyglot: Shell executes the exec line, Python sees the ''' and starts a multiline string.
+'''exec' "\$(dirname "\$0")/${VENV_DIR}/bin/python" "\$0" "\$@"
+'''
+# === This script is generated by install - Do not modify directly ===
+# === Source logic is in ${SOURCE_PYTHON_SCRIPT_NAME} ===
+# === Dependencies managed via ${REQUIREMENTS_FILE_NAME} ===
+# === Python code starts below ===
+EOF
+
+# --- Read Python Code Body from SOURCE script ---
+# Skip the first line (#!/usr/bin/env python3) - this remains the same
+PYTHON_CODE_BODY=$(tail -n +2 "${SOURCE_PYTHON_SCRIPT}" 2>/dev/null || true)
+if [ -z "$PYTHON_CODE_BODY" ]; then
+    echo "Error: Failed to read code body from ${SOURCE_PYTHON_SCRIPT_NAME}" >&2
+    exit 1
+fi
+
+# --- Write the final executable ---
+TARGET_TMP="${TARGET_EXECUTABLE}.tmp"
+# Use printf for better portability and control over newlines compared to echo
+# This part remains the same - print shebang block then python code block
+{
+  printf "%s\n" "$POLYGLOT_SHEBANG"
+  printf "%s\n" "$PYTHON_CODE_BODY"
+} > "$TARGET_TMP" || { echo "Error: Failed to write to temporary file ${TARGET_TMP}" >&2; exit 1; }
+
+# Ensure the temporary file was actually created before moving - remains the same
+if [ ! -f "$TARGET_TMP" ]; then
+    echo "Error: Temporary file ${TARGET_TMP} was not created." >&2
+    exit 1
+fi
+
+mv "$TARGET_TMP" "$TARGET_EXECUTABLE" || { echo "Error: Failed to move temporary file to ${TARGET_EXECUTABLE}." >&2; rm -f "$TARGET_TMP"; exit 1; }
+
+# === Step 6: Make Target Executable ===
+# This remains the same
+chmod +x "${TARGET_EXECUTABLE}"
+echo "${TARGET_EXECUTABLE_NAME} created and is now executable."
+
+# --- Finished ---
+# This remains the same
+echo ""
+echo "Setup complete!"
+echo "You can now run the URL content cleaner from this directory:"
+echo "  ./${TARGET_EXECUTABLE_NAME}"
+echo ""
+echo "It will read URLs from '${SCRIPT_DIR}/${URL_LIST_FILE#"$SCRIPT_DIR/"}'" # Show relative path
+echo "And save cleaned HTML files to '${SCRIPT_DIR}/${OUTPUT_DIR#"$SCRIPT_DIR/"}/'" # Show relative path
+echo ""
+
+exit 0
