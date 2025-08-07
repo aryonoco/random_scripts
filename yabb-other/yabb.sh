@@ -235,8 +235,46 @@ calculate_backup_size() {
     local backup_type="$1"
 
     if [[ "$backup_type" == "incremental" ]]; then
-        log_info "Skipping size estimation for incremental backup (Btrfs limitation)"
-        echo "104857600"  # 100MB minimum
+        local parent_snap="${2:-}"  # Parent snapshot name passed from caller
+
+        if [[ -z "$parent_snap" ]]; then
+            log_warn "No parent snapshot provided for size estimation"
+            echo "104857600"  # 100MB minimum fallback
+            return
+        fi
+
+        log_info "Estimating incremental backup size..."
+
+        local estimated_size=0
+        local parent_path="${config[snap_dir]}/$parent_snap"
+        local current_path="${config[snap_dir]}/$SNAP_NAME"
+
+        # Try the more accurate receive --dump method
+        if command -v perl &>/dev/null; then
+            estimated_size=$(
+                btrfs send --no-data -q -p "$parent_path" "$current_path" 2>/dev/null | \
+                btrfs receive --dump 2>/dev/null | \
+                grep 'len=' | \
+                sed 's/.*len=//' | \
+                perl -lne '$sum += $_; END { print $sum || 0 }' 2>/dev/null
+            ) || estimated_size=0
+        fi
+
+        # If we got a size, add buffer and return. Otherwise use conservative estimate.
+        if [[ "$estimated_size" -gt 0 ]]; then
+            # Add 30% buffer for metadata overhead and compression variations
+            estimated_size=$((estimated_size * 130 / 100))
+            log_info "Estimated incremental size: $(format_bytes $estimated_size)"
+        else
+            # Conservative fallback: 10% of source or 100MB minimum
+            local source_size
+            source_size=$(du -sb "${config[source_vol]}" 2>/dev/null | cut -f1) || source_size=1073741824
+            estimated_size=$((source_size / 10))
+            [[ "$estimated_size" -lt 104857600 ]] && estimated_size=104857600
+            log_warn "Using conservative estimate: $(format_bytes $estimated_size)"
+        fi
+
+        echo "$estimated_size"
     else
         log_info "Calculating full backup size..." >&2
         local btrfs_show_output
@@ -444,8 +482,8 @@ if [[ -n "$PARENT_SNAP" ]]; then
     cleanup_partial_snapshot
 
     # Calculate space needed
-    log_info "Checking minimal space requirements for incremental backup..."
-    DELTA_SIZE=$(calculate_backup_size "incremental")
+    log_info "Checking space requirements for incremental backup..."
+    DELTA_SIZE=$(calculate_backup_size "incremental" "$PARENT_SNAP")
     check_destination_space "$DELTA_SIZE" || {
         BACKUP_SUCCESSFUL=false
         die "Aborting backup due to insufficient space"
