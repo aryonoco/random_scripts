@@ -237,7 +237,7 @@ calculate_backup_size() {
         log_info "Skipping size estimation for incremental backup (Btrfs limitation)"
         echo "104857600"  # 100MB minimum
     else
-        log_info "Calculating full backup size..."
+        log_info "Calculating full backup size..." >&2
         local btrfs_show_output
         btrfs_show_output=$(btrfs subvolume show "${config[snap_dir]}/$SNAP_NAME" 2>/dev/null) || true
 
