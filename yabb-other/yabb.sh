@@ -80,11 +80,12 @@ validate_config() {
     local validated_source
     validated_source=$(validate_path "${CONFIG[source_vol]}" "YABB_SOURCE_VOL" "true") || die "Failed to validate source volume"
     CONFIG[source_vol]="$validated_source"
-    validate_path "${CONFIG[dest_mount]}" "YABB_DEST_MOUNT" "false"  # Mount point may not exist yet
-    if [[ -d "${CONFIG[dest_mount]}" ]]; then
-        CONFIG[dest_mount]=$(realpath -- "${CONFIG[dest_mount]}" 2>/dev/null) || true
-    fi
-    validate_path "${CONFIG[lock_file]%/*}" "YABB_LOCK_FILE directory" "false"  # Check parent dir
+    local validated_dest
+    validated_dest=$(validate_path "${CONFIG[dest_mount]}" "YABB_DEST_MOUNT" "false") || die "Failed to validate destination mount"
+    CONFIG[dest_mount]="$validated_dest"
+    local validated_lock_dir
+    validated_lock_dir=$(validate_path "${CONFIG[lock_file]%/*}" "YABB_LOCK_FILE directory" "false") || die "Failed to validate lock file directory"
+    CONFIG[lock_file]="${validated_lock_dir}/$(basename "${CONFIG[lock_file]}")"
     validate_rate_limit "${CONFIG[scrub_rate_limit]}" "YABB_SCRUB_RATE_LIMIT"
     (( CONFIG[keep_minimum] > 0 )) || die "YABB_KEEP_MINIMUM must be at least 1"
     if (( CONFIG[verify_sample_percent] == 0 )); then
@@ -121,6 +122,7 @@ RESTORE_OPERATION=false
 RESTORE_SUCCESSFUL=false
 RESTORE_VERIFICATION_PASSED=true
 RECEIVED_SNAPSHOT_PATH=""
+RESTORE_POINT_PATH=""
 
 ########################################################
 #     Function Definitions                              #
@@ -423,8 +425,43 @@ verify_data_checksums() {
     [[ $sample_size -lt 10 && $total_files -ge 10 ]] && sample_size=10  # Minimum 10 files if available
     [[ $sample_size -gt $total_files ]] && sample_size=$total_files
     log_info "Sampling $sample_size of $total_files files for checksum verification..."
-    local file dd_error
-    while IFS= read -r file; do
+    # Build array of files using null-delimited input to handle filenames with newlines
+    local -a files=()
+    local file
+    while IFS= read -r -d '' file; do
+        files+=("$file")
+    done < <(find -- "$snapshot" -type f -print0 2>/dev/null)
+    
+    # Fisher-Yates shuffle to randomly sample files
+    local -a sampled_files=()
+    local num_files=${#files[@]}
+    if [[ $num_files -gt 0 ]]; then
+        # Take either sample_size or all files, whichever is smaller
+        local files_to_sample=$sample_size
+        [[ $files_to_sample -gt $num_files ]] && files_to_sample=$num_files
+        
+        # If we need all files, just copy the array
+        if [[ $files_to_sample -eq $num_files ]]; then
+            sampled_files=("${files[@]}")
+        else
+            # Fisher-Yates shuffle for random sampling
+            local -a indices=()
+            for ((i=0; i<num_files; i++)); do
+                indices[i]=$i
+            done
+            for ((i=0; i<files_to_sample; i++)); do
+                local j=$((i + RANDOM % (num_files - i)))
+                local temp=${indices[i]}
+                indices[i]=${indices[j]}
+                indices[j]=$temp
+                sampled_files+=("${files[${indices[i]}]}")
+            done
+        fi
+    fi
+    
+    # Verify the sampled files
+    local dd_error
+    for file in "${sampled_files[@]}"; do
         ((verified_files++))
         if ! dd_error=$(dd if="$file" of=/dev/null bs=1M status=none 2>&1); then
             ((failed_files++))
@@ -435,7 +472,7 @@ verify_data_checksums() {
         if (( verified_files % 100 == 0 )); then
             log_info "Verified $verified_files/$sample_size files..."
         fi
-    done < <(find -- "$snapshot" -type f 2>/dev/null | shuf -n -- "$sample_size" 2>/dev/null || find -- "$snapshot" -type f 2>/dev/null | head -n -- "$sample_size")
+    done
     if [[ $failed_files -gt 0 ]]; then
         log_error "Checksum verification failed for $failed_files files"
         VERIFICATION_PASSED=false
@@ -641,6 +678,7 @@ restore_from_backup() {
         delete_snapshot "$received_path" "received" || true
         die "Failed to create read-write restore snapshot"
     }
+    RESTORE_POINT_PATH="$restore_point"  # Track for cleanup if needed
 
     delete_snapshot "$received_path" "temporary read-only" || \
         log_warn "Could not remove temporary read-only snapshot: $received_path"
@@ -980,6 +1018,11 @@ cleanup_restore() {
         if [[ -n "$RECEIVED_SNAPSHOT_PATH" && -d "$RECEIVED_SNAPSHOT_PATH" ]]; then
             delete_snapshot "$RECEIVED_SNAPSHOT_PATH" "partial restore" || \
                 log_error "Could not remove partial restore snapshot"
+        fi
+        # Remove restore point if exists
+        if [[ -n "$RESTORE_POINT_PATH" && -d "$RESTORE_POINT_PATH" ]]; then
+            delete_snapshot "$RESTORE_POINT_PATH" "restore point" || \
+                log_error "Could not remove restore point snapshot"
         fi
     fi
     if [[ "$exit_code" -eq 0 && "$RESTORE_SUCCESSFUL" == "true" && \
