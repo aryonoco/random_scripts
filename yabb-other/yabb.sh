@@ -9,32 +9,100 @@ shopt -s lastpipe
 #     Configuration                                    #
 ########################################################
 
-declare -A CONFIG=(
-    [source_vol]="/data"
-    [dest_mount]="/mnt/external"
-    [min_free_gb]=1
-    [lock_file]="/var/lock/yabb.lock"
-    [retention_days]=30        # Delete snapshots older than this (0 = disabled)
-    [keep_minimum]=5           # Always keep at least this many snapshots
-    [verify_sample_percent]=5  # Percentage of files to sample for checksum verification
-    [minimum_days_between_scrubs]=30  # Minimum days between automatic scrubs (0 = disabled)
-    [scrub_rate_limit]=""      # Optional rate limit for scrub (e.g., "100M")
-)
+# Declare configuration array
+declare -A CONFIG=()
+
+# Helper function for validating integer ranges
+validate_integer_range() {
+    local value="$1" min="$2" max="$3" name="$4"
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= min && value <= max )) ||
+        die "$name must be an integer between $min-$max (got: '$value')"
+}
+
+# Helper function for validating paths
+validate_path() {
+    local path="$1" name="$2" must_exist="$3"
+
+    # Check for path traversal attempts
+    [[ "$path" =~ \.\. ]] && die "$name contains invalid path traversal sequences"
+
+    # Check existence if required
+    if [[ "$must_exist" == "true" ]]; then
+        [[ -d "$path" ]] || die "$name path does not exist: $path"
+    fi
+}
+
+# Helper function for validating rate limits
+validate_rate_limit() {
+    local rate="$1" name="$2"
+
+    # Allow empty rate limits
+    [[ -z "$rate" ]] && return 0
+
+    # Check format: number followed by unit (K, M, G, or none)
+    [[ "$rate" =~ ^[0-9]+[KMG]?$ ]] ||
+        die "$name must be a number optionally followed by K, M, or G (got: '$rate')"
+}
+
+# Initialize configuration from environment or defaults
+initialize_config() {
+    # Use parameter expansion with :- to handle empty values
+    CONFIG[source_vol]="${YABB_SOURCE_VOL:-/data}"
+    CONFIG[dest_mount]="${YABB_DEST_MOUNT:-/mnt/external}"
+    CONFIG[min_free_gb]="${YABB_MIN_FREE_GB:-1}"
+    CONFIG[lock_file]="${YABB_LOCK_FILE:-/var/lock/yabb.lock}"
+    CONFIG[retention_days]="${YABB_RETENTION_DAYS:-30}"
+    CONFIG[keep_minimum]="${YABB_KEEP_MINIMUM:-5}"
+    CONFIG[verify_sample_percent]="${YABB_VERIFY_SAMPLE_PERCENT:-5}"
+    CONFIG[minimum_days_between_scrubs]="${YABB_MINIMUM_DAYS_BETWEEN_SCRUBS:-30}"
+    CONFIG[scrub_rate_limit]="${YABB_SCRUB_RATE_LIMIT:-}"
+}
+
+# Validate configuration
+validate_config() {
+    # Validate numeric ranges using the helper function
+    validate_integer_range "${CONFIG[min_free_gb]}" 0 1000000 "YABB_MIN_FREE_GB"  # Up to 1PB
+    validate_integer_range "${CONFIG[retention_days]}" 0 36500 "YABB_RETENTION_DAYS"  # Up to 100 years
+    validate_integer_range "${CONFIG[keep_minimum]}" 0 100000 "YABB_KEEP_MINIMUM"  # Up to 100k snapshots
+    validate_integer_range "${CONFIG[verify_sample_percent]}" 0 100 "YABB_VERIFY_SAMPLE_PERCENT"
+    validate_integer_range "${CONFIG[minimum_days_between_scrubs]}" 0 3650 "YABB_MINIMUM_DAYS_BETWEEN_SCRUBS"  # Up to 10 years
+
+    # Validate paths
+    validate_path "${CONFIG[source_vol]}" "YABB_SOURCE_VOL" "true"
+    validate_path "${CONFIG[dest_mount]}" "YABB_DEST_MOUNT" "false"  # Mount point may not exist yet
+    validate_path "${CONFIG[lock_file]%/*}" "YABB_LOCK_FILE directory" "false"  # Check parent dir
+
+    # Validate rate limit format
+    validate_rate_limit "${CONFIG[scrub_rate_limit]}" "YABB_SCRUB_RATE_LIMIT"
+
+    # Additional logical validations
+    (( CONFIG[keep_minimum] > 0 )) || die "YABB_KEEP_MINIMUM must be at least 1"
+
+    # Warn about potentially problematic configurations
+    if (( CONFIG[retention_days] > 0 && CONFIG[retention_days] < 7 )); then
+        log_warn "Retention period of ${CONFIG[retention_days]} days is very short"
+    fi
+
+    if (( CONFIG[verify_sample_percent] == 0 )); then
+        log_warn "Checksum verification is disabled (YABB_VERIFY_SAMPLE_PERCENT=0)"
+    fi
+}
+
+# Create nameref for backward compatibility
 declare -n config=CONFIG
 
 ########################################################
 #     Global Variables                                 #
 ########################################################
 
-SOURCE_BASE=$(basename "${config[source_vol]}")
-SNAP_NAME="${SOURCE_BASE}.$(date -u "+%Y-%m-%dT%H:%M:%SZ")"
+# These will be initialized after configuration is loaded
+SOURCE_BASE=""
+SNAP_NAME=""
 SRC_UUID=""
 DEST_UUID=""
 DELTA_SIZE=""
-
-# Derive snapshot directories from source and destination
-SNAP_DIR="${config[source_vol]}/.yabb_snapshots"
-DEST_SNAP_DIR="${config[dest_mount]}/.yabb_snapshots"
+SNAP_DIR=""
+DEST_SNAP_DIR=""
 
 # Device error tracking for verification
 PRE_BACKUP_ERRORS=0
@@ -71,6 +139,21 @@ die() {
     log_error "$@"
     exit 1
 }
+
+# Initialize and validate configuration now that die() is available
+initialize_config
+validate_config
+
+# Initialize global variables that depend on configuration
+initialize_globals() {
+    SOURCE_BASE=$(basename "${config[source_vol]}")
+    SNAP_NAME="${SOURCE_BASE}.$(date -u "+%Y-%m-%dT%H:%M:%SZ")"
+    SNAP_DIR="${config[source_vol]}/.yabb_snapshots"
+    DEST_SNAP_DIR="${config[dest_mount]}/.yabb_snapshots"
+}
+
+# Initialize globals after config is loaded
+initialize_globals
 
 check_dependencies() {
     command -v bc &>/dev/null || die "bc calculator required but not found. Install on Debian with 'sudo apt install bc'"
@@ -384,10 +467,10 @@ verify_data_checksums() {
 # Schedule periodic scrub if needed
 schedule_periodic_scrub() {
     local mount_point="$1"
-    
+
     # Get the minimum days between scrubs configuration
     local min_days_between_scrubs="${config[minimum_days_between_scrubs]:-30}"
-    
+
     # Skip if periodic scrub is disabled (0 means disabled)
     [[ "$min_days_between_scrubs" -eq 0 ]] && return 0
 
@@ -707,17 +790,36 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  --version, -v   Show version information"
     echo "  --restore NAME  Restore snapshot (use 'latest' for most recent)"
     echo ""
-    echo "Configuration:"
-    echo "  Source: ${config[source_vol]}"
-    echo "  Source Snapshots: ${config[source_vol]}/.yabb_snapshots"
-    echo "  Destination: ${config[dest_mount]}"
-    echo "  Destination Snapshots: ${config[dest_mount]}/.yabb_snapshots"
+    echo "Environment Variables:"
+    echo "  YABB_SOURCE_VOL                    Source volume path (default: /data)"
+    echo "  YABB_DEST_MOUNT                    Destination mount point (default: /mnt/external)"
+    echo "  YABB_MIN_FREE_GB                   Minimum free space in GB (default: 1)"
+    echo "  YABB_LOCK_FILE                     Lock file path (default: /var/lock/yabb.lock)"
+    echo "  YABB_RETENTION_DAYS                Days to retain snapshots (default: 30, 0=disabled)"
+    echo "  YABB_KEEP_MINIMUM                  Minimum snapshots to keep (default: 5)"
+    echo "  YABB_VERIFY_SAMPLE_PERCENT         File sample % for verification (default: 5, 0=disabled)"
+    echo "  YABB_MINIMUM_DAYS_BETWEEN_SCRUBS   Days between scrubs (default: 30, 0=disabled)"
+    echo "  YABB_SCRUB_RATE_LIMIT              Scrub rate limit, e.g., 100M (default: none)"
     echo ""
-    echo "Verification Settings:"
-    echo "  Post-backup scrub: Always enabled"
-    echo "  Device error monitoring: Always enabled"
-    echo "  Checksum sampling: ${config[verify_sample_percent]}%"
-    echo "  Periodic scrub interval: ${config[minimum_days_between_scrubs]} days"
+    echo "Current Configuration:"
+    echo "  Source: ${config[source_vol]}"
+    echo "  Destination: ${config[dest_mount]}"
+    echo "  Min Free GB: ${config[min_free_gb]}"
+    echo "  Retention Days: ${config[retention_days]}"
+    echo "  Keep Minimum: ${config[keep_minimum]}"
+    echo "  Verify Sample: ${config[verify_sample_percent]}%"
+    echo "  Scrub Interval: ${config[minimum_days_between_scrubs]} days"
+    echo "  Scrub Rate Limit: ${config[scrub_rate_limit]:-none}"
+    echo ""
+    echo "Examples:"
+    echo "  # Use custom paths"
+    echo "  YABB_SOURCE_VOL=/home YABB_DEST_MOUNT=/backup ./yabb.sh"
+    echo ""
+    echo "  # Disable verification"
+    echo "  YABB_VERIFY_SAMPLE_PERCENT=0 ./yabb.sh"
+    echo ""
+    echo "  # Aggressive retention"
+    echo "  YABB_RETENTION_DAYS=7 YABB_KEEP_MINIMUM=3 ./yabb.sh"
     exit 0
 fi
 
