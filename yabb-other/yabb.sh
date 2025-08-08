@@ -64,7 +64,7 @@ initialize_config() {
     CONFIG[dest_mount]="${YABB_DEST_MOUNT:-/mnt/external}"
     CONFIG[min_free_gb]="${YABB_MIN_FREE_GB:-1}"
     CONFIG[lock_file]="${YABB_LOCK_FILE:-/var/lock/yabb.lock}"
-    CONFIG[retention_days]="${YABB_RETENTION_DAYS:-30}"
+    CONFIG[retention_days]="${YABB_RETENTION_DAYS:-90}"
     CONFIG[keep_minimum]="${YABB_KEEP_MINIMUM:-5}"
     CONFIG[verify_sample_percent]="${YABB_VERIFY_SAMPLE_PERCENT:-5}"
     CONFIG[minimum_days_between_scrubs]="${YABB_MINIMUM_DAYS_BETWEEN_SCRUBS:-30}"
@@ -431,7 +431,7 @@ verify_data_checksums() {
     while IFS= read -r -d '' file; do
         files+=("$file")
     done < <(find -- "$snapshot" -type f -print0 2>/dev/null)
-    
+
     # Fisher-Yates shuffle to randomly sample files
     local -a sampled_files=()
     local num_files=${#files[@]}
@@ -439,12 +439,10 @@ verify_data_checksums() {
         # Take either sample_size or all files, whichever is smaller
         local files_to_sample=$sample_size
         [[ $files_to_sample -gt $num_files ]] && files_to_sample=$num_files
-        
-        # If we need all files, just copy the array
+
         if [[ $files_to_sample -eq $num_files ]]; then
             sampled_files=("${files[@]}")
         else
-            # Fisher-Yates shuffle for random sampling
             local -a indices=()
             for ((i=0; i<num_files; i++)); do
                 indices[i]=$i
@@ -458,8 +456,7 @@ verify_data_checksums() {
             done
         fi
     fi
-    
-    # Verify the sampled files
+
     local dd_error
     for file in "${sampled_files[@]}"; do
         ((verified_files++))
@@ -768,13 +765,10 @@ prune_old_snapshots() {
         all_snapshots+=("$snap_epoch:$snapshot")
     done < <(find -- "$location" -maxdepth 1 -name "${SOURCE_BASE}.*" -type d -print0)
 
-    # Sort by age (oldest first)
-    # Use a subshell to protect IFS
-    local sorted_snapshots_raw
-    sorted_snapshots_raw=$(printf '%s\n' "${all_snapshots[@]}" | sort -n) || return 1
+    # Sort by age (oldest first) - use null delimiters to handle filenames with newlines
     local -a sorted_snapshots=()
-    if [[ -n "$sorted_snapshots_raw" ]]; then
-        mapfile -t sorted_snapshots <<< "$sorted_snapshots_raw"
+    if [[ ${#all_snapshots[@]} -gt 0 ]]; then
+        mapfile -d '' -t sorted_snapshots < <(printf '%s\0' "${all_snapshots[@]}" | sort -zn)
     fi
     local total_count=${#sorted_snapshots[@]}
     local keep_count="${config[keep_minimum]:-5}"
