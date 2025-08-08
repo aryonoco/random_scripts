@@ -748,8 +748,9 @@ prune_old_snapshots() {
     done < <(find "$location" -maxdepth 1 -name "${SOURCE_BASE}.*" -type d -print0)
 
     # Sort by age (oldest first)
+    local OLD_IFS="$IFS"
     IFS=$'\n' sorted_snapshots=($(sort -n <<<"${all_snapshots[*]}"))
-    unset IFS
+    IFS="$OLD_IFS"
     local total_count=${#sorted_snapshots[@]}
     local keep_count="${config[keep_minimum]:-5}"
     for snapshot_info in "${sorted_snapshots[@]}"; do
