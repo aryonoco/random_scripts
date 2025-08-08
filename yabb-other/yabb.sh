@@ -770,9 +770,12 @@ prune_old_snapshots() {
 
     # Sort by age (oldest first)
     # Use a subshell to protect IFS
-    local sorted_snapshots
-    sorted_snapshots=$(printf '%s\n' "${all_snapshots[@]}" | sort -n) || return 1
-    mapfile -t sorted_snapshots <<< "$sorted_snapshots"
+    local sorted_snapshots_raw
+    sorted_snapshots_raw=$(printf '%s\n' "${all_snapshots[@]}" | sort -n) || return 1
+    local -a sorted_snapshots=()
+    if [[ -n "$sorted_snapshots_raw" ]]; then
+        mapfile -t sorted_snapshots <<< "$sorted_snapshots_raw"
+    fi
     local total_count=${#sorted_snapshots[@]}
     local keep_count="${config[keep_minimum]:-5}"
     for snapshot_info in "${sorted_snapshots[@]}"; do
