@@ -20,19 +20,56 @@ validate_integer_range() {
 validate_path() {
     local path="$1" name="$2" must_exist="$3"
 
-    [[ "$path" =~ \.\. ]] && die "$name contains invalid path traversal sequences"
+    if [[ "$path" =~ \.\. ]] || [[ "$path" =~ /\.\./ ]] || [[ "$path" =~ ^\.\. ]] || [[ "$path" =~ /\.$  ]]; then
+        die "$name contains invalid path traversal sequences"
+    fi
+
+    if [[ "$path" =~ %2e%2e ]] || [[ "$path" =~ %252e%252e ]] || [[ "$path" =~ \.%2e ]]; then
+        die "$name contains encoded path traversal sequences"
+    fi
+
+    if echo "$path" | grep -qE '(\xc0[\x2e\xae]|\xe0\x80[\x2e\xae]|\xf0\x80\x80[\x2e\xae])'; then
+        die "$name contains unicode path traversal sequences"
+    fi
 
     if [[ "$must_exist" == "true" ]]; then
         [[ -d "$path" ]] || die "$name path does not exist: $path"
+
+        local normalized_path
+        normalized_path=$(realpath "$path" 2>/dev/null) || die "Failed to normalize $name path: $path"
+
+        [[ "$normalized_path" == /* ]] || die "$name must be an absolute path after normalization"
+
+        local canonical_path
+        canonical_path=$(readlink -f "$path" 2>/dev/null) || die "Failed to resolve $name path: $path"
+        [[ "$normalized_path" == "$canonical_path" ]] || {
+            log_warn "$name path normalization mismatch - possible symlink traversal attempt"
+            log_warn "Normalized: $normalized_path"
+            log_warn "Canonical: $canonical_path"
+            die "$name path validation failed"
+        }
+    else
+        # For paths that don't exist yet, validate the parent directory
+        local parent_dir=$(dirname "$path")
+        if [[ -d "$parent_dir" ]]; then
+            local normalized_parent
+            normalized_parent=$(realpath "$parent_dir" 2>/dev/null) || die "Failed to normalize parent of $name: $parent_dir"
+            local basename_part=$(basename "$path")
+            if [[ "$basename_part" =~ \.\. ]] || [[ "$basename_part" == "." ]] || [[ -z "$basename_part" ]]; then
+                die "$name basename contains invalid characters"
+            fi
+            [[ "$normalized_parent" == /* ]] || die "$name parent must be an absolute path"
+        fi
+    fi
+
+    if [[ "$path" =~ $'\x00' ]]; then
+        die "$name contains null bytes"
     fi
 }
 
 validate_rate_limit() {
     local rate="$1" name="$2"
-
-    # Allow empty rate limits
     [[ -z "$rate" ]] && return 0
-
     # Check format: number followed by unit (K, M, G, or none)
     [[ "$rate" =~ ^[0-9]+[KMG]?$ ]] ||
         die "$name must be a number optionally followed by K, M, or G (got: '$rate')"
@@ -58,12 +95,16 @@ validate_config() {
     validate_integer_range "${CONFIG[verify_sample_percent]}" 0 100 "YABB_VERIFY_SAMPLE_PERCENT"
     validate_integer_range "${CONFIG[minimum_days_between_scrubs]}" 0 3650 "YABB_MINIMUM_DAYS_BETWEEN_SCRUBS"  # Up to 10 years
     validate_path "${CONFIG[source_vol]}" "YABB_SOURCE_VOL" "true"
+    if [[ -d "${CONFIG[source_vol]}" ]]; then
+        CONFIG[source_vol]=$(realpath "${CONFIG[source_vol]}" 2>/dev/null) || true
+    fi
     validate_path "${CONFIG[dest_mount]}" "YABB_DEST_MOUNT" "false"  # Mount point may not exist yet
+    if [[ -d "${CONFIG[dest_mount]}" ]]; then
+        CONFIG[dest_mount]=$(realpath "${CONFIG[dest_mount]}" 2>/dev/null) || true
+    fi
     validate_path "${CONFIG[lock_file]%/*}" "YABB_LOCK_FILE directory" "false"  # Check parent dir
     validate_rate_limit "${CONFIG[scrub_rate_limit]}" "YABB_SCRUB_RATE_LIMIT"
-
     (( CONFIG[keep_minimum] > 0 )) || die "YABB_KEEP_MINIMUM must be at least 1"
-
     if (( CONFIG[verify_sample_percent] == 0 )); then
         log_warn "Checksum verification is disabled (YABB_VERIFY_SAMPLE_PERCENT=0)"
     fi
@@ -85,6 +126,7 @@ SNAP_DIR=""
 DEST_SNAP_DIR=""
 PRE_BACKUP_ERRORS=0
 POST_BACKUP_ERRORS=0
+declare -a TEMP_FILES=()
 
 ########################################################
 #     State Variables                                  #
@@ -202,22 +244,18 @@ check_destination_space() {
     local buffer=$(convert_to_bytes "${config[min_free_gb]}GB")
     local required_with_buffer=$((required_bytes + buffer))
     local free_bytes=""
-
     log_info "Checking destination free space on ${dest_mount@Q}..."
 
     local btrfs_output
     btrfs_output=$(btrfs filesystem usage -b "$dest_mount") || die "Failed to check destination filesystem"
-
     if [[ "$btrfs_output" =~ Free\ \(estimated\):[[:space:]]+([0-9]+) ]]; then
         free_bytes=${BASH_REMATCH[1]}
     else
         die "Could not parse free space from btrfs output"
     fi
-
     if [[ ! "$free_bytes" =~ ^[0-9]+$ ]]; then
         die "Invalid free space value parsed: '$free_bytes'"
     fi
-
     log_info "Destination space status:"
     log_info " - Btrfs estimated free: $(format_bytes "$free_bytes")"
     log_info " - Required space: $(format_bytes "$required_with_buffer") (including ${config[min_free_gb]}GB buffer)"
@@ -233,6 +271,35 @@ acquire_lock() {
     umask "$original_umask"
     flock -n 9 || die "Another backup is already in progress"
     printf "%d\n" $$ >&9 || die "Failed to write PID to lock file"
+}
+
+release_lock() {
+    if { >&9; } 2>/dev/null; then
+        exec 9>&-
+    fi
+    if [[ -f "${config[lock_file]}" ]]; then
+        local lock_pid=$(cat "${config[lock_file]}" 2>/dev/null || echo 0)
+        if [[ "$lock_pid" == "$$" ]]; then
+            rm -f "${config[lock_file]}"
+        fi
+    fi
+}
+
+register_temp_file() {
+    local temp_file="$1"
+    if [[ -n "$temp_file" ]]; then
+        TEMP_FILES+=("$temp_file")
+    fi
+}
+
+cleanup_temp_files() {
+    local temp_file
+    for temp_file in "${TEMP_FILES[@]}"; do
+        if [[ -f "$temp_file" ]]; then
+            rm -f "$temp_file" 2>/dev/null || true
+        fi
+    done
+    TEMP_FILES=()
 }
 
 ensure_snapshot_directories() {
@@ -459,49 +526,75 @@ execute_restore_pipeline() {
     local destination_parent="$2"
     local snapshot_basename=$(basename "$source_snapshot")
     log_info "Starting restore send/receive pipeline..."
-    local receive_marker="/tmp/.yabb-restore-receive-$$"
-    local error_log="/tmp/.yabb-restore-error-$$"
-    local pipeline_result=0
+    local receive_marker=$(mktemp /tmp/.yabb-restore-receive.XXXXXX) || die "Failed to create temporary marker file"
+    local error_log_base=$(mktemp -u /tmp/.yabb-restore-error.XXXXXX) || die "Failed to create temporary error log base"
+    local error_log="${error_log_base}"
+    register_temp_file "$receive_marker"
+    register_temp_file "${error_log_base}.send"
+    register_temp_file "${error_log_base}.receive"
+    set +o pipefail
     btrfs send "$source_snapshot" 2>"$error_log.send" | \
         pv -petab 2>"$error_log.pv" | \
-        { touch "$receive_marker"; btrfs receive "$destination_parent/" 2>"$error_log.receive"; } || \
-        pipeline_result=$?
+        { touch "$receive_marker"; btrfs receive "$destination_parent/" 2>"$error_log.receive"; }
+    local -a pipeline_status=("${PIPESTATUS[@]}")
+    set -o pipefail
+    local send_status=${pipeline_status[0]:-0}
+    local pv_status=${pipeline_status[1]:-0}
+    local receive_status=${pipeline_status[2]:-0}
 
-    local send_status=${PIPESTATUS[0]:-0}
-    local pv_status=${PIPESTATUS[1]:-0}
-    local receive_status=${PIPESTATUS[2]:-0}
     local receive_started=false
     [[ -f "$receive_marker" ]] && receive_started=true
     rm -f "$receive_marker"
     if (( send_status != 0 )); then
         [[ -s "$error_log.send" ]] && log_error "Send error:" && cat "$error_log.send" >&2
+
+        if [[ "$receive_started" == "true" ]]; then
+            local partial_path="$destination_parent/$snapshot_basename"
+            if [[ -d "$partial_path" ]]; then
+                log_info "Send failed after receive started, removing partial restore..."
+                delete_snapshot "$partial_path" "partial restore" || true
+            fi
+        fi
         rm -f "$error_log".*
         die "btrfs send failed during restore (code: $send_status)"
     fi
 
     if (( receive_status != 0 )); then
         [[ -s "$error_log.receive" ]] && log_error "Receive error:" && cat "$error_log.receive" >&2
-        # Clean up partial receive if it exists
+
         local partial_path="$destination_parent/$snapshot_basename"
-        [[ -d "$partial_path" ]] && delete_snapshot "$partial_path" "partial restore" || true
+        if [[ -d "$partial_path" ]]; then
+            log_info "Receive failed, removing partial restore..."
+            delete_snapshot "$partial_path" "partial restore" || true
+        fi
         rm -f "$error_log".*
         die "btrfs receive failed during restore (code: $receive_status)"
     fi
 
-    if (( pv_status != 0 )); then
+    if (( pv_status != 0 && pv_status != 141 )); then
+        # Exit code 141 is SIGPIPE which can happen normally
         [[ -s "$error_log.pv" ]] && log_warn "Progress monitor warning:" && cat "$error_log.pv" >&2
+        # Don't die on pv errors if send and receive succeeded
+        if (( pv_status > 1 && pv_status != 141 )); then
+            log_warn "Progress monitor (pv) had issues but restore continued (code ${pv_status})"
+        fi
     fi
 
+    local restored_path="$destination_parent/$snapshot_basename"
+    if [[ ! -d "$restored_path" ]]; then
+        rm -f "$error_log".*
+        die "Restore pipeline completed but snapshot was not created at $restored_path"
+    fi
     rm -f "$error_log".*
+    log_info "Restore pipeline completed successfully"
     # Return the path of received snapshot
-    echo "$destination_parent/$snapshot_basename"
+    echo "$restored_path"
 }
 
 restore_from_backup() {
     local snapshot_name="${1:-latest}"
     local custom_restore_point="${2:-}"
     RESTORE_OPERATION=true
-
     log_info "=== Starting YABB Emergency Recovery Mode ==="
     log_info "Restore request: ${snapshot_name@Q}"
     check_dependencies
@@ -595,8 +688,10 @@ schedule_periodic_scrub() {
 
     local state_dir="/var/lib/yabb"
     [[ -d "$state_dir" ]] || mkdir -p "$state_dir" 2>/dev/null || state_dir="/tmp"
+    local mount_point_safe="${mount_point//\//_}"
+    mount_point_safe="${mount_point_safe//[^a-zA-Z0-9_-]/_}"
+    local last_scrub_file="$state_dir/.last_scrub_${mount_point_safe}"
 
-    local last_scrub_file="$state_dir/.last_scrub_${mount_point//\//_}"
     local current_time=$(date +%s)
     local last_scrub_time=0
 
@@ -610,7 +705,16 @@ schedule_periodic_scrub() {
         scrub_cmd+=("$mount_point")
 
         if "${scrub_cmd[@]}" 2>&1; then
-            echo "$current_time" > "$last_scrub_file"
+            local temp_scrub_file=$(mktemp "$state_dir/.last_scrub_${mount_point_safe}.XXXXXX") || {
+                log_warn "Failed to create temp file for scrub timestamp"
+                return 1
+            }
+            register_temp_file "$temp_scrub_file"
+            echo "$current_time" > "$temp_scrub_file" && \
+                mv -f "$temp_scrub_file" "$last_scrub_file" || {
+                    rm -f "$temp_scrub_file"
+                    log_warn "Failed to update scrub timestamp"
+                }
             log_info "Periodic scrub completed successfully"
         else
             log_warn "Periodic scrub encountered errors"
@@ -648,7 +752,7 @@ prune_old_snapshots() {
         local epoch="${snapshot_info%%:*}"
         local path="${snapshot_info#*:}"
 
-        # Always keep minimum number regardless of age
+        # Keep minimum number regardless of age
         if (( total_count - ${#snapshots_to_delete[@]} <= keep_count )); then
             break
         fi
@@ -680,7 +784,6 @@ calculate_backup_size() {
         fi
 
         log_info "Estimating incremental backup size..."
-
         local estimated_size=0
         local parent_path="$SNAP_DIR/$parent_snap"
         local current_path="$SNAP_DIR/$SNAP_NAME"
@@ -706,7 +809,6 @@ calculate_backup_size() {
             [[ "$estimated_size" -lt 104857600 ]] && estimated_size=104857600
             log_warn "Using conservative estimate: $(format_bytes $estimated_size)"
         fi
-
         echo "$estimated_size"
     else
         log_info "Calculating full backup size..." >&2
@@ -733,8 +835,12 @@ execute_backup_pipeline() {
     local backup_type="$1"
     local parent_snap="${2:-}"  # Optional parent snapshot for incremental
     log_info "Starting $backup_type send with progress monitoring"
-    local receive_marker="/tmp/.yabb-receive-$$-$SNAP_NAME"
-    local error_log="/tmp/.yabb-error-$$-$SNAP_NAME"
+    local receive_marker=$(mktemp /tmp/.yabb-receive.XXXXXX) || die "Failed to create temporary marker file"
+    local error_log_base=$(mktemp -u /tmp/.yabb-error.XXXXXX) || die "Failed to create temporary error log base"
+    local error_log="${error_log_base}"
+    register_temp_file "$receive_marker"
+    register_temp_file "${error_log_base}.send"
+    register_temp_file "${error_log_base}.receive"
 
     # Build command array based on backup type
     local -a send_cmd
@@ -751,23 +857,30 @@ execute_backup_pipeline() {
         )
     fi
 
-    local pipeline_result=0
+    set +o pipefail
     "${send_cmd[@]}" 2>"$error_log.send" | \
         pv -petab 2>"$error_log.pv" | \
         { touch "$receive_marker"; btrfs receive "$DEST_SNAP_DIR/" 2>"$error_log.receive"; } | \
-        grep -v 'write .* offset=' || pipeline_result=$?
+        grep -v 'write .* offset=' 2>/dev/null
 
-    local send_status=${PIPESTATUS[0]:-0}
-    local pv_status=${PIPESTATUS[1]:-0}
-    local receive_status=${PIPESTATUS[2]:-0}
-    local grep_status=${PIPESTATUS[3]:-0}
+    local -a pipeline_status=("${PIPESTATUS[@]}")
+    set -o pipefail
+
+    local send_status=${pipeline_status[0]:-0}
+    local pv_status=${pipeline_status[1]:-0}
+    local receive_status=${pipeline_status[2]:-0}
+    local grep_status=${pipeline_status[3]:-0}
+
     local receive_started=false
     [[ -f "$receive_marker" ]] && receive_started=true
     rm -f "$receive_marker"
+
     if (( send_status != 0 )); then
         [[ -s "$error_log.send" ]] && log_error "Send error details:" && cat "$error_log.send" >&2
+
+        # Clean up partial snapshot if receive had started
         if [[ "$receive_started" == "true" && -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
-            log_info "Send failed, removing partial destination snapshot..."
+            log_info "Send failed after receive started, removing partial destination snapshot..."
             delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "partial destination" || true
         fi
         rm -f "$error_log".*
@@ -776,6 +889,8 @@ execute_backup_pipeline() {
 
     if (( receive_status != 0 )); then
         [[ -s "$error_log.receive" ]] && log_error "Receive error details:" && cat "$error_log.receive" >&2
+
+        # Clean up partial receive
         if [[ -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
             log_info "Receive failed, removing partial destination snapshot..."
             delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "partial destination" || true
@@ -784,13 +899,22 @@ execute_backup_pipeline() {
         die "btrfs receive failed with code ${receive_status}"
     fi
 
-    if (( pv_status != 0 )); then
-        [[ -s "$error_log.pv" ]] && log_error "Progress monitor error:" && cat "$error_log.pv" >&2
-        rm -f "$error_log".*
-        die "Progress monitor (pv) failed with code ${pv_status}"
+    if (( pv_status != 0 && pv_status != 141 )); then
+        # Exit code 141 is SIGPIPE which can happen normally when grep filters output
+        [[ -s "$error_log.pv" ]] && log_warn "Progress monitor warning:" && cat "$error_log.pv" >&2
+        # Don't die on pv errors if send and receive succeeded
+        if (( pv_status > 1 && pv_status != 141 )); then
+            log_warn "Progress monitor (pv) had issues but backup continued (code ${pv_status})"
+        fi
     fi
-    # Clean up error logs if successful
+
+    if [[ ! -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
+        rm -f "$error_log".*
+        die "Backup pipeline completed but destination snapshot was not created"
+    fi
+
     rm -f "$error_log".*
+    log_info "Backup pipeline completed successfully"
 }
 
 finalize_backup() {
@@ -814,7 +938,6 @@ finalize_backup() {
             log_warn "Checksum verification detected issues with backup"
         }
     fi
-
     log_info "Syncing destination filesystem..."
     btrfs filesystem sync "${config[dest_mount]}"
     if [[ "$VERIFICATION_PASSED" == "true" ]]; then
@@ -827,6 +950,9 @@ finalize_backup() {
 cleanup() {
     local exit_code=$?
     log_info "Performing cleanup..."
+    release_lock
+    cleanup_temp_files
+
     if [[ "$SNAPSHOT_CREATED" == "true" && "$BACKUP_SUCCESSFUL" != "true" ]]; then
         log_warn "Backup failed or was interrupted. Removing snapshots..."
         # Remove source snapshot
@@ -861,6 +987,8 @@ cleanup_restore() {
         return  # Not a restore operation
     fi
     log_info "Performing restore cleanup..."
+    release_lock
+    cleanup_temp_files
     # Clean up failed restore attempts
     if [[ "$RESTORE_SUCCESSFUL" != "true" ]]; then
         log_warn "Restore operation failed or was interrupted"
