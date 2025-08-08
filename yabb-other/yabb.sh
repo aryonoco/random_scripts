@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
+# YABB - Yet Another BTRFS Backup
+#
 export LC_ALL=C
 set -euo pipefail
 shopt -s lastpipe
+
+########################################################
+#     Configuration                                    #
+########################################################
 
 declare -A CONFIG=()
 
@@ -47,11 +53,13 @@ validate_path() {
 validate_rate_limit() {
     local rate="$1" name="$2"
     [[ -z "$rate" ]] && return 0
+    # Check format: number followed by unit (K, M, G, or none)
     [[ "$rate" =~ ^[0-9]+[KMG]?$ ]] ||
         die "$name must be a number optionally followed by K, M, or G (got: '$rate')"
 }
 
 initialize_config() {
+    # Use parameter expansion with :- to handle empty values
     CONFIG[source_vol]="${YABB_SOURCE_VOL:-/data}"
     CONFIG[dest_mount]="${YABB_DEST_MOUNT:-/mnt/external}"
     CONFIG[min_free_gb]="${YABB_MIN_FREE_GB:-1}"
@@ -64,23 +72,19 @@ initialize_config() {
 }
 
 validate_config() {
-    validate_integer_range "${CONFIG[min_free_gb]}" 0 1000000 "YABB_MIN_FREE_GB"
-    validate_integer_range "${CONFIG[retention_days]}" 0 36500 "YABB_RETENTION_DAYS"
-    validate_integer_range "${CONFIG[keep_minimum]}" 0 100000 "YABB_KEEP_MINIMUM"
+    validate_integer_range "${CONFIG[min_free_gb]}" 0 1000000 "YABB_MIN_FREE_GB"  # Up to 1PB
+    validate_integer_range "${CONFIG[retention_days]}" 0 36500 "YABB_RETENTION_DAYS"  # Up to 100 years
+    validate_integer_range "${CONFIG[keep_minimum]}" 0 100000 "YABB_KEEP_MINIMUM"  # Up to 100k snapshots
     validate_integer_range "${CONFIG[verify_sample_percent]}" 0 100 "YABB_VERIFY_SAMPLE_PERCENT"
-    validate_integer_range "${CONFIG[minimum_days_between_scrubs]}" 0 3650 "YABB_MINIMUM_DAYS_BETWEEN_SCRUBS"
+    validate_integer_range "${CONFIG[minimum_days_between_scrubs]}" 0 3650 "YABB_MINIMUM_DAYS_BETWEEN_SCRUBS"  # Up to 10 years
     local validated_source
     validated_source=$(validate_path "${CONFIG[source_vol]}" "YABB_SOURCE_VOL" "true") || die "Failed to validate source volume"
     CONFIG[source_vol]="$validated_source"
-    local validated_dest
-    validated_dest=$(validate_path "${CONFIG[dest_mount]}" "YABB_DEST_MOUNT" "false") || die "Failed to validate destination mount"
-    CONFIG[dest_mount]="$validated_dest"
+    validate_path "${CONFIG[dest_mount]}" "YABB_DEST_MOUNT" "false"  # Mount point may not exist yet
     if [[ -d "${CONFIG[dest_mount]}" ]]; then
         CONFIG[dest_mount]=$(realpath -- "${CONFIG[dest_mount]}" 2>/dev/null) || true
     fi
-    local validated_lock_dir
-    validated_lock_dir=$(validate_path "${CONFIG[lock_file]%/*}" "YABB_LOCK_FILE directory" "false") || die "Failed to validate lock file directory"
-    CONFIG[lock_file]="${validated_lock_dir}/$(basename -- "${CONFIG[lock_file]}")"
+    validate_path "${CONFIG[lock_file]%/*}" "YABB_LOCK_FILE directory" "false"  # Check parent dir
     validate_rate_limit "${CONFIG[scrub_rate_limit]}" "YABB_SCRUB_RATE_LIMIT"
     (( CONFIG[keep_minimum] > 0 )) || die "YABB_KEEP_MINIMUM must be at least 1"
     if (( CONFIG[verify_sample_percent] == 0 )); then
@@ -88,7 +92,12 @@ validate_config() {
     fi
 }
 
+# For backward compatibility
 declare -n config=CONFIG
+
+########################################################
+#     Global Variables                                 #
+########################################################
 
 SOURCE_BASE=""
 SNAP_NAME=""
@@ -101,6 +110,10 @@ PRE_BACKUP_ERRORS=0
 POST_BACKUP_ERRORS=0
 declare -a TEMP_FILES=()
 
+########################################################
+#     State Variables                                  #
+########################################################
+
 SNAPSHOT_CREATED=false
 BACKUP_SUCCESSFUL=false
 VERIFICATION_PASSED=true
@@ -108,7 +121,10 @@ RESTORE_OPERATION=false
 RESTORE_SUCCESSFUL=false
 RESTORE_VERIFICATION_PASSED=true
 RECEIVED_SNAPSHOT_PATH=""
-RESTORE_POINT_PATH=""
+
+########################################################
+#     Function Definitions                              #
+########################################################
 
 readonly LOG_TIMESTAMP_FORMAT='%Y-%m-%dT%H:%M:%SZ'
 
@@ -131,6 +147,7 @@ die() {
 
 initialize_config
 validate_config
+
 initialize_globals() {
     SOURCE_BASE=$(basename -- "${config[source_vol]}")
     if [[ "$SOURCE_BASE" == "/" ]]; then
@@ -167,7 +184,7 @@ format_bytes() {
     local result
 
     (( bytes == 0 )) && { echo "0 B"; return; }
-    while (( unit < ${
+    while (( unit < ${#units[@]}-1 )); do
         result=$(echo "scale=2; $bytes / 1024" | bc)
         if (( $(echo "$result >= 1" | bc) == 1 )); then
             bytes=$result
@@ -190,20 +207,21 @@ convert_to_bytes() {
     local unit=${BASH_REMATCH[2]^^}
     local factor
     case "$unit" in
-        "")    factor=1 ;;
+        "")    factor=1 ;;          # No unit means bytes
         "B")   factor=1 ;;
         "KB")  factor=1024 ;;
         "MB")  factor=$((1024**2)) ;;
         "GB")  factor=$((1024**3)) ;;
         "TB")  factor=$((1024**4)) ;;
-        *)     return 1 ;;
+        *)     return 1 ;;          # Invalid unit
     esac
     printf "%.0f\n" "$(echo "$value * $factor" | bc)"
 }
 
+# Extract epoch timestamp from snapshot name
 get_snapshot_epoch() {
     local snap_name="$1"
-    local timestamp="${snap_name#*.}"
+    local timestamp="${snap_name#*.}"  # Remove prefix
     date -d -- "${timestamp/T/ }" +%s 2>/dev/null || echo 0
 }
 
@@ -313,10 +331,12 @@ delete_snapshot() {
     local snapshot_path="$1"
     local description="$2"
     log_info "Removing $description snapshot ${snapshot_path}..."
+    # Normal delete first
     if btrfs subvolume delete -- "$snapshot_path" 2>/dev/null; then
         log_info "Successfully removed $description snapshot"
         return 0
     fi
+    # Try with -c flag for partial/corrupted snapshots
     if btrfs subvolume delete -c -- "$snapshot_path" 2>/dev/null; then
         log_info "Successfully removed $description snapshot (with -c flag)"
         return 0
@@ -332,6 +352,10 @@ cleanup_partial_snapshot() {
             die "Cannot remove partial snapshot at $DEST_SNAP_DIR/$SNAP_NAME"
     fi
 }
+
+########################################################
+#     Verification Functions                           #
+########################################################
 
 check_device_errors() {
     local mount_point="$1"
@@ -388,50 +412,30 @@ verify_backup_with_scrub() {
 
 verify_data_checksums() {
     local snapshot="$1"
-    local sample_percentage="${2:-${config[verify_sample_percent]:-5}}"
+    local sample_percentage="${2:-${config[verify_sample_percent]:-5}}"  # Default 5% sampling
+    # Skip if sampling is disabled
     [[ "$sample_percentage" -eq 0 ]] && return 0
     log_info "Verifying data integrity via checksum reads (${sample_percentage}% sample)..."
     local total_files verified_files=0 failed_files=0
-
-    local -a file_array=()
-    while IFS= read -r -d '' file; do
-        file_array+=("$file")
-    done < <(find -- "$snapshot" -type f -print0 2>/dev/null)
-
-    total_files=${
+    total_files=$(find -- "$snapshot" -type f 2>/dev/null | wc -l)
     [[ "$total_files" -eq 0 ]] && { log_info "No files to verify in snapshot"; return 0; }
-
     local sample_size=$((total_files * sample_percentage / 100))
-    [[ $sample_size -lt 10 && $total_files -ge 10 ]] && sample_size=10
+    [[ $sample_size -lt 10 && $total_files -ge 10 ]] && sample_size=10  # Minimum 10 files if available
     [[ $sample_size -gt $total_files ]] && sample_size=$total_files
     log_info "Sampling $sample_size of $total_files files for checksum verification..."
-
-    local -a indices=()
-    for ((i=0; i<total_files; i++)); do
-        indices+=($i)
-    done
-
-    for ((i=0; i<sample_size && i<total_files; i++)); do
-        local j=$((i + RANDOM % (total_files - i)))
-        local temp=${indices[i]}
-        indices[i]=${indices[j]}
-        indices[j]=$temp
-    done
-
     local file dd_error
-    for ((i=0; i<sample_size; i++)); do
-        file="${file_array[${indices[i]}]}"
+    while IFS= read -r file; do
         ((verified_files++))
         if ! dd_error=$(dd if="$file" of=/dev/null bs=1M status=none 2>&1); then
             ((failed_files++))
             log_error "Checksum verification failed for: $file"
             [[ -n "$dd_error" ]] && log_error "  Error details: $dd_error"
         fi
+        # Progress indication every 100 files
         if (( verified_files % 100 == 0 )); then
             log_info "Verified $verified_files/$sample_size files..."
         fi
-    done
-
+    done < <(find -- "$snapshot" -type f 2>/dev/null | shuf -n -- "$sample_size" 2>/dev/null || find -- "$snapshot" -type f 2>/dev/null | head -n -- "$sample_size")
     if [[ $failed_files -gt 0 ]]; then
         log_error "Checksum verification failed for $failed_files files"
         VERIFICATION_PASSED=false
@@ -446,6 +450,7 @@ find_restore_snapshot() {
     local snapshot_name="${1:-latest}"
     local search_dir="${DEST_SNAP_DIR}"
     if [[ "$snapshot_name" == "latest" ]]; then
+        # Find most recent snapshot
         local latest_snap
         latest_snap=$(find -- "$search_dir" -maxdepth 1 -name "${SOURCE_BASE}.*" \
                      -printf '%T@ %p\n' 2>/dev/null | \
@@ -453,6 +458,7 @@ find_restore_snapshot() {
         [[ -z "$latest_snap" ]] && return 1
         echo "$latest_snap"
     else
+        # Check if specific snapshot exists
         local specific_snap="$search_dir/$snapshot_name"
         [[ -d "$specific_snap" ]] || return 1
         echo "$specific_snap"
@@ -463,9 +469,11 @@ calculate_restore_space() {
     local source_snapshot="$1"
     local snap_size
     snap_size=$(du -sb -- "$source_snapshot" 2>/dev/null | cut -f1) || {
-        echo "1073741824"
+        # Fallback to a conservative estimate
+        echo "1073741824"  # 1GB minimum
         return
     }
+    # Add 20% buffer for filesystem overhead
     echo $((snap_size * 120 / 100))
 }
 
@@ -475,6 +483,7 @@ check_restore_destination_space() {
     local buffer=$(convert_to_bytes "${config[min_free_gb]}GB")
     local required_with_buffer=$((required_bytes + buffer))
     log_info "Checking restore destination free space..."
+    # Check if restore parent is on BTRFS
     local fs_type
     fs_type=$(stat -f -c %T -- "$restore_parent_dir" 2>/dev/null) || \
         fs_type=$(df -T -- "$restore_parent_dir" | tail -n 1 | awk '{print $2}')
@@ -482,6 +491,7 @@ check_restore_destination_space() {
     if [[ "$fs_type" != "btrfs" ]]; then
         die "Restore destination must be on a BTRFS filesystem (found: $fs_type)"
     fi
+    # Get free space
     local btrfs_output free_bytes
     btrfs_output=$(btrfs filesystem usage -b -- "$restore_parent_dir") || \
         die "Failed to check restore destination filesystem"
@@ -550,7 +560,9 @@ execute_restore_pipeline() {
     fi
 
     if (( pv_status != 0 && pv_status != 141 )); then
+        # Exit code 141 is SIGPIPE which can happen normally
         [[ -s "$error_log.pv" ]] && log_warn "Progress monitor warning:" && cat -- "$error_log.pv" >&2
+        # Don't die on pv errors if send and receive succeeded
         if (( pv_status > 1 && pv_status != 141 )); then
             log_warn "Progress monitor (pv) had issues but restore continued (code ${pv_status})"
         fi
@@ -563,6 +575,7 @@ execute_restore_pipeline() {
     fi
     rm -f -- "$error_log".*
     log_info "Restore pipeline completed successfully" >&2
+    # Return the path of received snapshot
     echo "$restored_path"
 }
 
@@ -605,6 +618,7 @@ restore_from_backup() {
         restore_point="$custom_restore_point"
         restore_parent_dir=$(dirname -- "$restore_point")
     else
+        # Default: create .restore version next to original
         restore_point="${config[source_vol]}.restore"
     fi
 
@@ -623,7 +637,6 @@ restore_from_backup() {
 
     log_info "Snapshot received at: $received_path"
     log_info "Creating read-write restore point..."
-    RESTORE_POINT_PATH="$restore_point"
     btrfs subvolume snapshot -- "$received_path" "$restore_point" || {
         delete_snapshot "$received_path" "received" || true
         die "Failed to create read-write restore snapshot"
@@ -636,6 +649,7 @@ restore_from_backup() {
     verify_data_checksums "$restore_point" 10 || {
         log_error "Post-restore verification failed!"
         RESTORE_VERIFICATION_PASSED=false
+        # Don't die here - data is restored but may have issues
     }
 
     check_device_errors "$restore_parent_dir" "post-restore"
@@ -656,6 +670,7 @@ restore_from_backup() {
 schedule_periodic_scrub() {
     local mount_point="$1"
     local min_days_between_scrubs="${config[minimum_days_between_scrubs]:-30}"
+    # Skip if periodic scrub is disabled (0 means disabled)
     [[ "$min_days_between_scrubs" -eq 0 ]] && return 0
 
     local state_dir="/var/lib/yabb"
@@ -695,8 +710,9 @@ schedule_periodic_scrub() {
 }
 
 prune_old_snapshots() {
-    local location="$1"
+    local location="$1"  # Either snap_dir or dest_mount
 
+    # Skip if retention disabled
     [[ "${config[retention_days]:-0}" -eq 0 ]] && return 0
     [[ ! -d "$location" ]] && return 1
 
@@ -714,16 +730,19 @@ prune_old_snapshots() {
         all_snapshots+=("$snap_epoch:$snapshot")
     done < <(find -- "$location" -maxdepth 1 -name "${SOURCE_BASE}.*" -type d -print0)
 
+    # Sort by age (oldest first)
+    # Use a subshell to protect IFS
     local sorted_snapshots
     sorted_snapshots=$(printf '%s\n' "${all_snapshots[@]}" | sort -n) || return 1
     mapfile -t sorted_snapshots <<< "$sorted_snapshots"
-    local total_count=${
+    local total_count=${#sorted_snapshots[@]}
     local keep_count="${config[keep_minimum]:-5}"
     for snapshot_info in "${sorted_snapshots[@]}"; do
         local epoch="${snapshot_info%%:*}"
         local path="${snapshot_info#*:}"
 
-        if (( total_count - ${
+        # Keep minimum number regardless of age
+        if (( total_count - ${#snapshots_to_delete[@]} <= keep_count )); then
             break
         fi
 
@@ -732,7 +751,7 @@ prune_old_snapshots() {
         fi
     done
 
-    if [[ ${
+    if [[ ${#snapshots_to_delete[@]} -gt 0 ]]; then
         log_info "Pruning ${#snapshots_to_delete[@]} old snapshots from $location"
 
         for snapshot in "${snapshots_to_delete[@]}"; do
@@ -749,7 +768,7 @@ calculate_backup_size() {
 
         if [[ -z "$parent_snap" ]]; then
             log_warn "No parent snapshot provided for size estimation"
-            echo "104857600"
+            echo "104857600"  # 100MB minimum fallback
             return
         fi
         log_info "Estimating incremental backup size..." >&2
@@ -765,10 +784,13 @@ calculate_backup_size() {
                 perl -lne '$sum += $_; END { print $sum || 0 }' 2>/dev/null
             ) || estimated_size=0
         fi
+        # If we got a size, add buffer and return. Otherwise use conservative estimate.
         if [[ "$estimated_size" -gt 0 ]]; then
+            # Add 30% buffer for metadata overhead and compression variations
             estimated_size=$((estimated_size * 130 / 100))
             log_info "Estimated incremental size: $(format_bytes $estimated_size)" >&2
         else
+            # Conservative fallback: 10% of source or 100MB minimum
             local source_size
             source_size=$(du -sb -- "${config[source_vol]}" 2>/dev/null | cut -f1) || source_size=1073741824
             estimated_size=$((source_size / 10))
@@ -780,12 +802,14 @@ calculate_backup_size() {
         log_info "Calculating full backup size..." >&2
         local btrfs_show_output
         btrfs_show_output=$(btrfs subvolume show -- "$SNAP_DIR/$SNAP_NAME" 2>/dev/null) || true
+        # Try multiple patterns to be more resilient to format changes
         local size=""
         if [[ "$btrfs_show_output" =~ Total\ bytes:[[:space:]]+([0-9,]+) ]]; then
             size=${BASH_REMATCH[1]//,/}
         elif [[ "$btrfs_show_output" =~ [Tt]otal[[:space:]]+[Bb]ytes:[[:space:]]+([0-9,]+) ]]; then
             size=${BASH_REMATCH[1]//,/}
         fi
+        # Fallback to du if btrfs parsing fails
         if [[ ! "$size" =~ ^[0-9]+$ ]]; then
             log_warn "Could not parse btrfs output, falling back to du"
             size=$(du -sb -- "$SNAP_DIR/$SNAP_NAME" | cut -f1)
@@ -797,7 +821,7 @@ calculate_backup_size() {
 
 execute_backup_pipeline() {
     local backup_type="$1"
-    local parent_snap="${2:-}"
+    local parent_snap="${2:-}"  # Optional parent snapshot for incremental
     log_info "Starting $backup_type send with progress monitoring"
     local receive_marker=$(mktemp /tmp/.yabb-receive.XXXXXX) || die "Failed to create temporary marker file"
     local error_log_base=$(mktemp -u /tmp/.yabb-error.XXXXXX) || die "Failed to create temporary error log base"
@@ -806,6 +830,7 @@ execute_backup_pipeline() {
     register_temp_file "${error_log_base}.send"
     register_temp_file "${error_log_base}.receive"
 
+    # Build command array based on backup type
     local -a send_cmd
     if [[ "$backup_type" == "incremental" && -n "$parent_snap" ]]; then
         send_cmd=(
@@ -838,6 +863,7 @@ execute_backup_pipeline() {
     if (( send_status != 0 )); then
         [[ -s "$error_log.send" ]] && log_error "Send error details:" && cat -- "$error_log.send" >&2
 
+        # Clean up partial snapshot if receive had started
         if [[ "$receive_started" == "true" && -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
             log_info "Send failed after receive started, removing partial destination snapshot..."
             delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "partial destination" || true
@@ -848,6 +874,7 @@ execute_backup_pipeline() {
 
     if (( receive_status != 0 )); then
         [[ -s "$error_log.receive" ]] && log_error "Receive error details:" && cat -- "$error_log.receive" >&2
+        # Clean up partial receive
         if [[ -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
             log_info "Receive failed, removing partial destination snapshot..."
             delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "partial destination" || true
@@ -857,7 +884,9 @@ execute_backup_pipeline() {
     fi
 
     if (( pv_status != 0 && pv_status != 141 )); then
+        # Exit code 141 is SIGPIPE which can happen normally when grep filters output
         [[ -s "$error_log.pv" ]] && log_warn "Progress monitor warning:" && cat -- "$error_log.pv" >&2
+        # Don't die on pv errors if send and receive succeeded
         if (( pv_status > 1 && pv_status != 141 )); then
             log_warn "Progress monitor (pv) had issues but backup continued (code ${pv_status})"
         fi
@@ -910,6 +939,7 @@ cleanup() {
 
     if [[ "$SNAPSHOT_CREATED" == "true" && "$BACKUP_SUCCESSFUL" != "true" ]]; then
         log_warn "Backup failed or was interrupted. Removing snapshots..."
+        # Remove source snapshot
         if [[ -d "$SNAP_DIR/$SNAP_NAME" ]]; then
             local retries=3
             while (( retries-- > 0 )); do
@@ -920,6 +950,7 @@ cleanup() {
             done
             (( retries < 0 )) && log_error "Permanent failure removing source snapshot!"
         fi
+        # Remove destination snapshot
         if [[ -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
             delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "destination" || \
                 log_error "Could not remove destination snapshot!"
@@ -927,7 +958,7 @@ cleanup() {
     fi
 
     if [[ "$exit_code" -eq 0 && "$BACKUP_SUCCESSFUL" == "true" && "$VERIFICATION_PASSED" != "true" ]]; then
-        exit_code=2
+        exit_code=2  # Backup succeeded but verification found issues
     fi
 
     exit $exit_code
@@ -937,30 +968,31 @@ cleanup_restore() {
     local exit_code=$?
 
     if [[ "$RESTORE_OPERATION" != "true" ]]; then
-        return
+        return  # Not a restore operation
     fi
     log_info "Performing restore cleanup..."
     release_lock
     cleanup_temp_files
+    # Clean up failed restore attempts
     if [[ "$RESTORE_SUCCESSFUL" != "true" ]]; then
         log_warn "Restore operation failed or was interrupted"
+        # Remove partial received snapshot if exists
         if [[ -n "$RECEIVED_SNAPSHOT_PATH" && -d "$RECEIVED_SNAPSHOT_PATH" ]]; then
             delete_snapshot "$RECEIVED_SNAPSHOT_PATH" "partial restore" || \
                 log_error "Could not remove partial restore snapshot"
         fi
-        if [[ -n "$RESTORE_POINT_PATH" && -d "$RESTORE_POINT_PATH" ]]; then
-            log_info "Removing incomplete restore point: $RESTORE_POINT_PATH"
-            delete_snapshot "$RESTORE_POINT_PATH" "incomplete restore" || \
-                log_error "Could not remove incomplete restore point"
-        fi
     fi
     if [[ "$exit_code" -eq 0 && "$RESTORE_SUCCESSFUL" == "true" && \
           "$RESTORE_VERIFICATION_PASSED" != "true" ]]; then
-        exit_code=3
+        exit_code=3  # Restore succeeded but verification found issues
     fi
 
     exit $exit_code
 }
+
+########################################################
+#     Main Process                                      #
+########################################################
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
     echo "YABB (Yet Another BTRFS Backup) v0.1.0"
@@ -1016,7 +1048,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 fi
 
 if [[ "${1:-}" == "--restore" ]]; then
-    shift
+    shift  # Remove --restore from arguments
+    # Override trap for restore-specific cleanup
     trap 'cleanup_restore' EXIT INT TERM HUP
 
     restore_from_backup "${1:-latest}" "${2:-}"
@@ -1025,33 +1058,41 @@ if [[ "${1:-}" == "--restore" ]]; then
         if [[ "$RESTORE_VERIFICATION_PASSED" == "true" ]]; then
             exit 0
         else
-            exit 3
+            exit 3  # Success with warnings
         fi
     else
-        exit 1
+        exit 1  # Failure
     fi
 fi
 
 trap 'cleanup' EXIT INT TERM HUP
 log_info "YABB (Yet Another BTRFS Backup) starting..."
+# Validate environment
 check_dependencies
 check_mount "source_vol"
 check_mount "dest_mount"
 ensure_snapshot_directories
+# Acquire lock
 acquire_lock
+# Device error check
 check_device_errors "${config[source_vol]}" "pre-backup"
 check_device_errors "${config[dest_mount]}" "pre-backup"
+# Create snapshot
 btrfs subvolume snapshot -r -- "${config[source_vol]}" "$SNAP_DIR/$SNAP_NAME" && \
     SNAPSHOT_CREATED=true || die "Failed to create snapshot ${SNAP_NAME@Q}"
 log_info "Created snapshot: ${SNAP_NAME@Q}"
+# Verify snapshot
 btrfs subvolume show -- "$SNAP_DIR/$SNAP_NAME" >/dev/null || \
     die "Failed to verify snapshot ${SNAP_NAME@Q}"
 
+# Find parent snapshot
 PARENT_SNAP=$(find_parent_snapshot) || {
     log_info "No parent snapshot available, will perform full backup"
     PARENT_SNAP=""
 }
+# Perform backup based on whether parent exists
 if [[ -n "$PARENT_SNAP" ]]; then
+    # Incremental backup
     log_info "Verifying parent snapshot on destination..."
     [[ -d "$DEST_SNAP_DIR/$PARENT_SNAP" ]] || \
         die "Parent snapshot ${PARENT_SNAP@Q} missing from destination"
@@ -1069,6 +1110,7 @@ if [[ -n "$PARENT_SNAP" ]]; then
     execute_backup_pipeline "incremental" "$PARENT_SNAP"
     finalize_backup "incremental"
 else
+    # Full backup
     cleanup_partial_snapshot
     DELTA_SIZE=$(calculate_backup_size "full")
     check_destination_space "$DELTA_SIZE" || {
@@ -1079,12 +1121,14 @@ else
     finalize_backup "full"
 fi
 
+# Prune old snapshots
 if [[ "$BACKUP_SUCCESSFUL" == "true" && "${config[retention_days]:-0}" -gt 0 ]]; then
     log_info "Starting snapshot pruning (retention: ${config[retention_days]} days, keep minimum: ${config[keep_minimum]:-5})"
     prune_old_snapshots "$SNAP_DIR"
     prune_old_snapshots "$DEST_SNAP_DIR"
 fi
 
+# Periodic scrub
 if [[ "$BACKUP_SUCCESSFUL" == "true" ]]; then
     schedule_periodic_scrub "${config[dest_mount]}"
 fi
