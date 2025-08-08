@@ -529,7 +529,7 @@ execute_restore_pipeline() {
     local source_snapshot="$1"
     local destination_parent="$2"
     local snapshot_basename=$(basename "$source_snapshot")
-    log_info "Starting restore send/receive pipeline..."
+    log_info "Starting restore send/receive pipeline..." >&2
     local receive_marker=$(mktemp /tmp/.yabb-restore-receive.XXXXXX) || die "Failed to create temporary marker file"
     local error_log_base=$(mktemp -u /tmp/.yabb-restore-error.XXXXXX) || die "Failed to create temporary error log base"
     local error_log="${error_log_base}"
@@ -590,7 +590,7 @@ execute_restore_pipeline() {
         die "Restore pipeline completed but snapshot was not created at $restored_path"
     fi
     rm -f "$error_log".*
-    log_info "Restore pipeline completed successfully"
+    log_info "Restore pipeline completed successfully" >&2
     # Return the path of received snapshot
     echo "$restored_path"
 }
@@ -787,7 +787,7 @@ calculate_backup_size() {
             return
         fi
 
-        log_info "Estimating incremental backup size..."
+        log_info "Estimating incremental backup size..." >&2
         local estimated_size=0
         local parent_path="$SNAP_DIR/$parent_snap"
         local current_path="$SNAP_DIR/$SNAP_NAME"
@@ -804,7 +804,7 @@ calculate_backup_size() {
         if [[ "$estimated_size" -gt 0 ]]; then
             # Add 30% buffer for metadata overhead and compression variations
             estimated_size=$((estimated_size * 130 / 100))
-            log_info "Estimated incremental size: $(format_bytes $estimated_size)"
+            log_info "Estimated incremental size: $(format_bytes $estimated_size)" >&2
         else
             # Conservative fallback: 10% of source or 100MB minimum
             local source_size
