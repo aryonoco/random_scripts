@@ -11,10 +11,11 @@ shopt -s lastpipe
 
 declare -A CONFIG=(
     [source_vol]="/data"
-    [snap_dir]="/data/.snapshots"
     [dest_mount]="/mnt/external"
     [min_free_gb]=1
     [lock_file]="/var/lock/yabb.lock"
+    [retention_days]=30        # Delete snapshots older than this (0 = disabled)
+    [keep_minimum]=5           # Always keep at least this many snapshots
 )
 declare -n config=CONFIG
 
@@ -27,6 +28,10 @@ SNAP_NAME="${SOURCE_BASE}.$(date -u "+%Y-%m-%dT%H:%M:%SZ")"
 SRC_UUID=""
 DEST_UUID=""
 DELTA_SIZE=""
+
+# Derive snapshot directories from source and destination
+SNAP_DIR="${config[source_vol]}/.yabb_snapshots"
+DEST_SNAP_DIR="${config[dest_mount]}/.yabb_snapshots"
 
 ########################################################
 #     State Variables                                  #
@@ -122,6 +127,14 @@ convert_to_bytes() {
     printf "%.0f\n" "$(echo "$value * $factor" | bc)"
 }
 
+# Extract epoch timestamp from snapshot name
+get_snapshot_epoch() {
+    local snap_name="$1"
+    # Extract timestamp from name like: data.2024-01-15T14:30:00Z
+    local timestamp="${snap_name#*.}"  # Remove prefix
+    date -d "${timestamp/T/ }" +%s 2>/dev/null || echo 0
+}
+
 check_destination_space() {
     local required_bytes=$1
     local dest_mount="${config[dest_mount]}"
@@ -166,8 +179,18 @@ acquire_lock() {
     printf "%d\n" $$ >&9 || die "Failed to write PID to lock file"
 }
 
-check_directory() {
-    [[ -d "${config[snap_dir]}" ]] || die "Snapshot directory ${config[snap_dir]@Q} missing"
+ensure_snapshot_directories() {
+    # Ensure source snapshot directory exists
+    if [[ ! -d "$SNAP_DIR" ]]; then
+        log_info "Creating source snapshot directory: ${SNAP_DIR@Q}"
+        mkdir -p "$SNAP_DIR" || die "Failed to create snapshot directory ${SNAP_DIR@Q}"
+    fi
+    
+    # Ensure destination snapshot directory exists
+    if [[ ! -d "$DEST_SNAP_DIR" ]]; then
+        log_info "Creating destination snapshot directory: ${DEST_SNAP_DIR@Q}"
+        mkdir -p "$DEST_SNAP_DIR" || die "Failed to create destination snapshot directory ${DEST_SNAP_DIR@Q}"
+    fi
 }
 
 check_mount() {
@@ -183,16 +206,16 @@ check_mount() {
 
 find_parent_snapshot() {
     local -a snapshots
-    find "${config[snap_dir]}" -maxdepth 1 -name "${SOURCE_BASE}.*" -printf '%T@ %p\0' |
+    find "$SNAP_DIR" -maxdepth 1 -name "${SOURCE_BASE}.*" -printf '%T@ %p\0' |
         sort -znr |
         mapfile -d '' -t snapshots
 
-    [[ ${#snapshots[@]} -eq 0 ]] && { log_warn "No existing snapshots found in ${config[snap_dir]@Q}"; return 1; }
+    [[ ${#snapshots[@]} -eq 0 ]] && { log_warn "No existing snapshots found in ${SNAP_DIR@Q}"; return 1; }
 
     for entry in "${snapshots[@]}"; do
         local snap_path="${entry#* }"
-        [[ "${snap_path}" != "${config[snap_dir]}/${SNAP_NAME}" ]] && {
-            echo "${snap_path#"${config[snap_dir]}/"}"
+        [[ "${snap_path}" != "$SNAP_DIR/${SNAP_NAME}" ]] && {
+            echo "${snap_path#"$SNAP_DIR/"}"
             return 0
         }
     done
@@ -224,10 +247,68 @@ delete_snapshot() {
 }
 
 cleanup_partial_snapshot() {
-    if [[ -d "${config[dest_mount]}/$SNAP_NAME" ]]; then
+    if [[ -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
         log_warn "Partial snapshot exists at destination, removing..."
-        delete_snapshot "${config[dest_mount]}/$SNAP_NAME" "partial" || \
-            die "Cannot remove partial snapshot at ${config[dest_mount]}/$SNAP_NAME"
+        delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "partial" || \
+            die "Cannot remove partial snapshot at $DEST_SNAP_DIR/$SNAP_NAME"
+    fi
+}
+
+# Prune old snapshots based on retention policy
+prune_old_snapshots() {
+    local location="$1"  # Either snap_dir or dest_mount
+
+    # Skip if retention disabled
+    [[ "${config[retention_days]:-0}" -eq 0 ]] && return 0
+    [[ ! -d "$location" ]] && return 1
+
+    local cutoff_epoch=$(($(date +%s) - config[retention_days] * 86400))
+    local -a snapshots_to_delete=()
+    local -a all_snapshots=()
+
+    # Collect all snapshots with timestamps
+    while IFS= read -r -d '' snapshot; do
+        local snap_name=$(basename "$snapshot")
+        # Skip current snapshot being created
+        [[ "$snap_name" == "$SNAP_NAME" ]] && continue
+
+        local snap_epoch=$(get_snapshot_epoch "$snap_name")
+        [[ "$snap_epoch" -eq 0 ]] && continue  # Skip if can't parse date
+
+        all_snapshots+=("$snap_epoch:$snapshot")
+    done < <(find "$location" -maxdepth 1 -name "${SOURCE_BASE}.*" -type d -print0)
+
+    # Sort by age (oldest first)
+    IFS=$'\n' sorted_snapshots=($(sort -n <<<"${all_snapshots[*]}"))
+    unset IFS
+
+    # Determine which to delete
+    local total_count=${#sorted_snapshots[@]}
+    local keep_count="${config[keep_minimum]:-5}"
+
+    for snapshot_info in "${sorted_snapshots[@]}"; do
+        local epoch="${snapshot_info%%:*}"
+        local path="${snapshot_info#*:}"
+
+        # Always keep minimum number regardless of age
+        if (( total_count - ${#snapshots_to_delete[@]} <= keep_count )); then
+            break
+        fi
+
+        # Delete if older than retention period
+        if (( epoch < cutoff_epoch )); then
+            snapshots_to_delete+=("$path")
+        fi
+    done
+
+    # Execute deletions
+    if [[ ${#snapshots_to_delete[@]} -gt 0 ]]; then
+        log_info "Pruning ${#snapshots_to_delete[@]} old snapshots from $location"
+
+        for snapshot in "${snapshots_to_delete[@]}"; do
+            delete_snapshot "$snapshot" "old" || \
+                log_warn "Failed to prune: $(basename "$snapshot")"
+        done
     fi
 }
 
@@ -246,8 +327,8 @@ calculate_backup_size() {
         log_info "Estimating incremental backup size..."
 
         local estimated_size=0
-        local parent_path="${config[snap_dir]}/$parent_snap"
-        local current_path="${config[snap_dir]}/$SNAP_NAME"
+        local parent_path="$SNAP_DIR/$parent_snap"
+        local current_path="$SNAP_DIR/$SNAP_NAME"
 
         # Try the more accurate receive --dump method
         if command -v perl &>/dev/null; then
@@ -278,7 +359,7 @@ calculate_backup_size() {
     else
         log_info "Calculating full backup size..." >&2
         local btrfs_show_output
-        btrfs_show_output=$(btrfs subvolume show "${config[snap_dir]}/$SNAP_NAME" 2>/dev/null) || true
+        btrfs_show_output=$(btrfs subvolume show "$SNAP_DIR/$SNAP_NAME" 2>/dev/null) || true
 
         # Try multiple patterns to be more resilient to format changes
         local size=""
@@ -291,7 +372,7 @@ calculate_backup_size() {
         # Fallback to du if btrfs parsing fails
         if [[ ! "$size" =~ ^[0-9]+$ ]]; then
             log_warn "Could not parse btrfs output, falling back to du"
-            size=$(du -sb "${config[snap_dir]}/$SNAP_NAME" | cut -f1)
+            size=$(du -sb "$SNAP_DIR/$SNAP_NAME" | cut -f1)
         fi
 
         echo "$size"
@@ -312,13 +393,13 @@ execute_backup_pipeline() {
     if [[ "$backup_type" == "incremental" && -n "$parent_snap" ]]; then
         send_cmd=(
             btrfs send
-            -p "${config[snap_dir]}/$parent_snap"
-            "${config[snap_dir]}/$SNAP_NAME"
+            -p "$SNAP_DIR/$parent_snap"
+            "$SNAP_DIR/$SNAP_NAME"
         )
     else
         send_cmd=(
             btrfs send
-            "${config[snap_dir]}/$SNAP_NAME"
+            "$SNAP_DIR/$SNAP_NAME"
         )
     fi
 
@@ -326,7 +407,7 @@ execute_backup_pipeline() {
     local pipeline_result=0
     "${send_cmd[@]}" 2>"$error_log.send" | \
         pv -petab 2>"$error_log.pv" | \
-        { touch "$receive_marker"; btrfs receive "${config[dest_mount]}/" 2>"$error_log.receive"; } | \
+        { touch "$receive_marker"; btrfs receive "$DEST_SNAP_DIR/" 2>"$error_log.receive"; } | \
         grep -v 'write .* offset=' || pipeline_result=$?
 
     local send_status=${PIPESTATUS[0]:-0}
@@ -340,9 +421,9 @@ execute_backup_pipeline() {
 
     if (( send_status != 0 )); then
         [[ -s "$error_log.send" ]] && log_error "Send error details:" && cat "$error_log.send" >&2
-        if [[ "$receive_started" == "true" && -d "${config[dest_mount]}/$SNAP_NAME" ]]; then
+        if [[ "$receive_started" == "true" && -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
             log_info "Send failed, removing partial destination snapshot..."
-            delete_snapshot "${config[dest_mount]}/$SNAP_NAME" "partial destination" || true
+            delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "partial destination" || true
         fi
         rm -f "$error_log".*
         die "btrfs send failed with code ${send_status}"
@@ -350,9 +431,9 @@ execute_backup_pipeline() {
 
     if (( receive_status != 0 )); then
         [[ -s "$error_log.receive" ]] && log_error "Receive error details:" && cat "$error_log.receive" >&2
-        if [[ -d "${config[dest_mount]}/$SNAP_NAME" ]]; then
+        if [[ -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
             log_info "Receive failed, removing partial destination snapshot..."
-            delete_snapshot "${config[dest_mount]}/$SNAP_NAME" "partial destination" || true
+            delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "partial destination" || true
         fi
         rm -f "$error_log".*
         die "btrfs receive failed with code ${receive_status}"
@@ -372,7 +453,7 @@ finalize_backup() {
     local backup_type="$1"
 
     log_info "Verifying destination snapshot integrity..."
-    verify_uuids "${config[snap_dir]}/$SNAP_NAME" "${config[dest_mount]}/$SNAP_NAME" || {
+    verify_uuids "$SNAP_DIR/$SNAP_NAME" "$DEST_SNAP_DIR/$SNAP_NAME" || {
         die "Destination snapshot UUID mismatch - possible corruption detected\nSource UUID: $SRC_UUID\nDestination UUID: $DEST_UUID"
     }
 
@@ -392,10 +473,10 @@ cleanup() {
         log_warn "Backup failed or was interrupted. Removing snapshots..."
 
         # Remove source snapshot
-        if [[ -d "${config[snap_dir]}/$SNAP_NAME" ]]; then
+        if [[ -d "$SNAP_DIR/$SNAP_NAME" ]]; then
             local retries=3
             while (( retries-- > 0 )); do
-                if delete_snapshot "${config[snap_dir]}/$SNAP_NAME" "source"; then
+                if delete_snapshot "$SNAP_DIR/$SNAP_NAME" "source"; then
                     break
                 fi
                 (( retries > 0 )) && sleep 1
@@ -404,8 +485,8 @@ cleanup() {
         fi
 
         # Remove destination snapshot
-        if [[ -d "${config[dest_mount]}/$SNAP_NAME" ]]; then
-            delete_snapshot "${config[dest_mount]}/$SNAP_NAME" "destination" || \
+        if [[ -d "$DEST_SNAP_DIR/$SNAP_NAME" ]]; then
+            delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "destination" || \
                 log_error "Could not remove destination snapshot!"
         fi
     fi
@@ -435,8 +516,9 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo ""
     echo "Configuration:"
     echo "  Source: ${config[source_vol]}"
-    echo "  Snapshots: ${config[snap_dir]}"
+    echo "  Source Snapshots: ${config[source_vol]}/.yabb_snapshots"
     echo "  Destination: ${config[dest_mount]}"
+    echo "  Destination Snapshots: ${config[dest_mount]}/.yabb_snapshots"
     exit 0
 fi
 
@@ -447,20 +529,20 @@ log_info "YABB (Yet Another BTRFS Backup) starting..."
 
 # Validate environment
 check_dependencies
-check_directory
 check_mount "source_vol"
 check_mount "dest_mount"
+ensure_snapshot_directories
 
 # Acquire lock
 acquire_lock
 
 # Create snapshot
-btrfs subvolume snapshot -r "${config[source_vol]}" "${config[snap_dir]}/$SNAP_NAME" && \
+btrfs subvolume snapshot -r "${config[source_vol]}" "$SNAP_DIR/$SNAP_NAME" && \
     SNAPSHOT_CREATED=true || die "Failed to create snapshot ${SNAP_NAME@Q}"
 log_info "Created snapshot: ${SNAP_NAME@Q}"
 
 # Verify snapshot
-btrfs subvolume show "${config[snap_dir]}/$SNAP_NAME" >/dev/null || \
+btrfs subvolume show "$SNAP_DIR/$SNAP_NAME" >/dev/null || \
     die "Failed to verify snapshot ${SNAP_NAME@Q}"
 
 # Find parent snapshot
@@ -473,10 +555,10 @@ PARENT_SNAP=$(find_parent_snapshot) || {
 if [[ -n "$PARENT_SNAP" ]]; then
     # Incremental backup
     log_info "Verifying parent snapshot on destination..."
-    [[ -d "${config[dest_mount]}/$PARENT_SNAP" ]] || \
+    [[ -d "$DEST_SNAP_DIR/$PARENT_SNAP" ]] || \
         die "Parent snapshot ${PARENT_SNAP@Q} missing from destination"
 
-    verify_uuids "${config[snap_dir]}/$PARENT_SNAP" "${config[dest_mount]}/$PARENT_SNAP" || \
+    verify_uuids "$SNAP_DIR/$PARENT_SNAP" "$DEST_SNAP_DIR/$PARENT_SNAP" || \
         die "Parent snapshot UUID mismatch - possible corruption!\nSource UUID: $SRC_UUID\nDest UUID: $DEST_UUID"
 
     cleanup_partial_snapshot
@@ -505,4 +587,11 @@ else
     execute_backup_pipeline "full"
 
     finalize_backup "full"
+fi
+
+# Prune old snapshots after successful backup
+if [[ "$BACKUP_SUCCESSFUL" == "true" && "${config[retention_days]:-0}" -gt 0 ]]; then
+    log_info "Starting snapshot pruning (retention: ${config[retention_days]} days, keep minimum: ${config[keep_minimum]:-5})"
+    prune_old_snapshots "$SNAP_DIR"
+    prune_old_snapshots "$DEST_SNAP_DIR"
 fi
