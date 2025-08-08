@@ -48,6 +48,7 @@ validate_path() {
             log_warn "Canonical: $canonical_path"
             die "$name path validation failed"
         }
+        echo "$normalized_path"
     else
         # For paths that don't exist yet, validate the parent directory
         local parent_dir=$(dirname "$path")
@@ -94,10 +95,7 @@ validate_config() {
     validate_integer_range "${CONFIG[keep_minimum]}" 0 100000 "YABB_KEEP_MINIMUM"  # Up to 100k snapshots
     validate_integer_range "${CONFIG[verify_sample_percent]}" 0 100 "YABB_VERIFY_SAMPLE_PERCENT"
     validate_integer_range "${CONFIG[minimum_days_between_scrubs]}" 0 3650 "YABB_MINIMUM_DAYS_BETWEEN_SCRUBS"  # Up to 10 years
-    validate_path "${CONFIG[source_vol]}" "YABB_SOURCE_VOL" "true"
-    if [[ -d "${CONFIG[source_vol]}" ]]; then
-        CONFIG[source_vol]=$(realpath "${CONFIG[source_vol]}" 2>/dev/null) || true
-    fi
+    CONFIG[source_vol]=$(validate_path "${CONFIG[source_vol]}" "YABB_SOURCE_VOL" "true")
     validate_path "${CONFIG[dest_mount]}" "YABB_DEST_MOUNT" "false"  # Mount point may not exist yet
     if [[ -d "${CONFIG[dest_mount]}" ]]; then
         CONFIG[dest_mount]=$(realpath "${CONFIG[dest_mount]}" 2>/dev/null) || true
@@ -168,6 +166,9 @@ validate_config
 
 initialize_globals() {
     SOURCE_BASE=$(basename "${config[source_vol]}")
+    if [[ "$SOURCE_BASE" == "/" ]]; then
+        SOURCE_BASE="root"
+    fi
     SNAP_NAME="${SOURCE_BASE}.$(date -u "+%Y-%m-%dT%H:%M:%SZ")"
     SNAP_DIR="${config[source_vol]}/.yabb_snapshots"
     DEST_SNAP_DIR="${config[dest_mount]}/.yabb_snapshots"
@@ -217,16 +218,18 @@ format_bytes() {
 }
 
 convert_to_bytes() {
-    [[ $1 =~ ^([0-9.]+)([[:alpha:]]+)$ ]] || return 1
+    [[ $1 =~ ^([0-9.]+)([[:alpha:]]+)?$ ]] || return 1
     local value=${BASH_REMATCH[1]}
     local unit=${BASH_REMATCH[2]^^}
+    local factor
     case "$unit" in
+        "")    factor=1 ;;          # No unit means bytes
         "B")   factor=1 ;;
         "KB")  factor=1024 ;;
         "MB")  factor=$((1024**2)) ;;
         "GB")  factor=$((1024**3)) ;;
         "TB")  factor=$((1024**4)) ;;
-        *)     factor=1 ;;
+        *)     return 1 ;;          # Invalid unit
     esac
     printf "%.0f\n" "$(echo "$value * $factor" | bc)"
 }
@@ -436,12 +439,13 @@ verify_data_checksums() {
     [[ $sample_size -lt 10 && $total_files -ge 10 ]] && sample_size=10  # Minimum 10 files if available
     [[ $sample_size -gt $total_files ]] && sample_size=$total_files
     log_info "Sampling $sample_size of $total_files files for checksum verification..."
-    local file
+    local file dd_error
     while IFS= read -r file; do
         ((verified_files++))
-        if ! dd if="$file" of=/dev/null bs=1M status=none 2>/dev/null; then
+        if ! dd_error=$(dd if="$file" of=/dev/null bs=1M status=none 2>&1); then
             ((failed_files++))
             log_error "Checksum verification failed for: $file"
+            [[ -n "$dd_error" ]] && log_error "  Error details: $dd_error"
         fi
         # Progress indication every 100 files
         if (( verified_files % 100 == 0 )); then
@@ -1090,7 +1094,7 @@ check_mount "dest_mount"
 ensure_snapshot_directories
 # Acquire lock
 acquire_lock
-# Pre-backup device error check
+# Device error check
 check_device_errors "${config[source_vol]}" "pre-backup"
 check_device_errors "${config[dest_mount]}" "pre-backup"
 # Create snapshot
@@ -1144,7 +1148,7 @@ if [[ "$BACKUP_SUCCESSFUL" == "true" && "${config[retention_days]:-0}" -gt 0 ]];
     prune_old_snapshots "$DEST_SNAP_DIR"
 fi
 
-# Schedule periodic scrub
+# Periodic scrub
 if [[ "$BACKUP_SUCCESSFUL" == "true" ]]; then
     schedule_periodic_scrub "${config[dest_mount]}"
 fi
