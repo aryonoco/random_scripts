@@ -16,6 +16,9 @@ declare -A CONFIG=(
     [lock_file]="/var/lock/yabb.lock"
     [retention_days]=30        # Delete snapshots older than this (0 = disabled)
     [keep_minimum]=5           # Always keep at least this many snapshots
+    [verify_sample_percent]=5  # Percentage of files to sample for checksum verification
+    [minimum_days_between_scrubs]=30  # Minimum days between automatic scrubs (0 = disabled)
+    [scrub_rate_limit]=""      # Optional rate limit for scrub (e.g., "100M")
 )
 declare -n config=CONFIG
 
@@ -33,12 +36,17 @@ DELTA_SIZE=""
 SNAP_DIR="${config[source_vol]}/.yabb_snapshots"
 DEST_SNAP_DIR="${config[dest_mount]}/.yabb_snapshots"
 
+# Device error tracking for verification
+PRE_BACKUP_ERRORS=0
+POST_BACKUP_ERRORS=0
+
 ########################################################
 #     State Variables                                  #
 ########################################################
 
 SNAPSHOT_CREATED=false
 BACKUP_SUCCESSFUL=false
+VERIFICATION_PASSED=true  # Track verification status
 
 ########################################################
 #     Function Definitions                              #
@@ -185,7 +193,7 @@ ensure_snapshot_directories() {
         log_info "Creating source snapshot directory: ${SNAP_DIR@Q}"
         mkdir -p "$SNAP_DIR" || die "Failed to create snapshot directory ${SNAP_DIR@Q}"
     fi
-    
+
     # Ensure destination snapshot directory exists
     if [[ ! -d "$DEST_SNAP_DIR" ]]; then
         log_info "Creating destination snapshot directory: ${DEST_SNAP_DIR@Q}"
@@ -251,6 +259,165 @@ cleanup_partial_snapshot() {
         log_warn "Partial snapshot exists at destination, removing..."
         delete_snapshot "$DEST_SNAP_DIR/$SNAP_NAME" "partial" || \
             die "Cannot remove partial snapshot at $DEST_SNAP_DIR/$SNAP_NAME"
+    fi
+}
+
+########################################################
+#     Verification Functions                           #
+########################################################
+
+# Check device error statistics
+check_device_errors() {
+    local mount_point="$1"
+    local phase="$2"  # "pre-backup" or "post-backup"
+
+    log_info "Checking device error statistics ($phase)..."
+
+    # Get device stats and check for non-zero errors
+    local stats_output exit_code
+    stats_output=$(btrfs device stats --check "$mount_point" 2>&1)
+    exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_warn "Device errors detected on $mount_point:"
+        btrfs device stats "$mount_point" 2>&1 | grep -v " 0$" >&2
+
+        # Store error counts for comparison
+        if [[ "$phase" == "pre-backup" ]]; then
+            PRE_BACKUP_ERRORS=$exit_code
+        else
+            POST_BACKUP_ERRORS=$exit_code
+            if [[ $POST_BACKUP_ERRORS -gt ${PRE_BACKUP_ERRORS:-0} ]]; then
+                log_error "New device errors occurred during backup!"
+                VERIFICATION_PASSED=false
+                return 1
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# Verify backup integrity using BTRFS scrub
+verify_backup_with_scrub() {
+    local snapshot_path="$1"
+    local description="$2"
+
+    log_info "Starting integrity verification via scrub for $description..."
+
+    # Build scrub command with optional rate limiting
+    local -a scrub_cmd=(btrfs scrub start -B)
+    [[ -n "${config[scrub_rate_limit]}" ]] && scrub_cmd+=(-r "${config[scrub_rate_limit]}")
+    scrub_cmd+=("$snapshot_path")
+
+    # Start scrub on the specific snapshot path
+    local scrub_output
+    if scrub_output=$("${scrub_cmd[@]}" 2>&1); then
+        # Parse scrub results - look for error summary
+        local error_summary
+        error_summary=$(echo "$scrub_output" | grep -E "Error summary:" || echo "Error summary: no errors found")
+
+        if [[ "$error_summary" =~ "no errors found" ]] || [[ "$error_summary" =~ " 0 " ]]; then
+            log_info "Scrub verification passed - no errors detected"
+            return 0
+        else
+            log_error "Scrub detected errors in backup: $error_summary"
+            VERIFICATION_PASSED=false
+            return 1
+        fi
+    else
+        log_warn "Scrub verification failed: $scrub_output"
+        VERIFICATION_PASSED=false
+        return 1
+    fi
+}
+
+# Verify data checksums by sampling files
+verify_data_checksums() {
+    local snapshot="$1"
+    local sample_percentage="${2:-${config[verify_sample_percent]:-5}}"  # Default 5% sampling
+
+    # Skip if sampling is disabled
+    [[ "$sample_percentage" -eq 0 ]] && return 0
+
+    log_info "Verifying data integrity via checksum reads (${sample_percentage}% sample)..."
+
+    local total_files verified_files=0 failed_files=0
+
+    # Count total files
+    total_files=$(find "$snapshot" -type f 2>/dev/null | wc -l)
+    [[ "$total_files" -eq 0 ]] && { log_info "No files to verify in snapshot"; return 0; }
+
+    local sample_size=$((total_files * sample_percentage / 100))
+    [[ $sample_size -lt 10 && $total_files -ge 10 ]] && sample_size=10  # Minimum 10 files if available
+    [[ $sample_size -gt $total_files ]] && sample_size=$total_files
+
+    log_info "Sampling $sample_size of $total_files files for checksum verification..."
+
+    # Sample and verify files using process substitution to avoid subshell variable issues
+    local file
+    while IFS= read -r file; do
+        ((verified_files++))
+
+        # Reading the file triggers BTRFS checksum verification
+        if ! dd if="$file" of=/dev/null bs=1M status=none 2>/dev/null; then
+            ((failed_files++))
+            log_error "Checksum verification failed for: $file"
+        fi
+
+        # Progress indication every 100 files
+        if (( verified_files % 100 == 0 )); then
+            log_info "Verified $verified_files/$sample_size files..."
+        fi
+    done < <(find "$snapshot" -type f 2>/dev/null | shuf -n "$sample_size" 2>/dev/null || find "$snapshot" -type f 2>/dev/null | head -n "$sample_size")
+
+    if [[ $failed_files -gt 0 ]]; then
+        log_error "Checksum verification failed for $failed_files files"
+        VERIFICATION_PASSED=false
+        return 1
+    else
+        log_info "Successfully verified $verified_files files (no checksum errors)"
+        return 0
+    fi
+}
+
+# Schedule periodic scrub if needed
+schedule_periodic_scrub() {
+    local mount_point="$1"
+    
+    # Get the minimum days between scrubs configuration
+    local min_days_between_scrubs="${config[minimum_days_between_scrubs]:-30}"
+    
+    # Skip if periodic scrub is disabled (0 means disabled)
+    [[ "$min_days_between_scrubs" -eq 0 ]] && return 0
+
+    # Ensure state directory exists
+    local state_dir="/var/lib/yabb"
+    [[ -d "$state_dir" ]] || mkdir -p "$state_dir" 2>/dev/null || state_dir="/tmp"
+
+    # Check if last scrub was more than configured days ago
+    local last_scrub_file="$state_dir/.last_scrub_${mount_point//\//_}"
+    local current_time=$(date +%s)
+    local last_scrub_time=0
+
+    [[ -f "$last_scrub_file" ]] && last_scrub_time=$(cat "$last_scrub_file" 2>/dev/null || echo 0)
+
+    local days_since_scrub=$(( (current_time - last_scrub_time) / 86400 ))
+
+    if [[ $days_since_scrub -gt $min_days_between_scrubs ]]; then
+        log_info "Starting periodic scrub (last scrub: ${days_since_scrub} days ago, threshold: ${min_days_between_scrubs} days)..."
+
+        # Build scrub command with optional rate limiting
+        local -a scrub_cmd=(btrfs scrub start -B)
+        [[ -n "${config[scrub_rate_limit]}" ]] && scrub_cmd+=(-r "${config[scrub_rate_limit]}")
+        scrub_cmd+=("$mount_point")
+
+        if "${scrub_cmd[@]}" 2>&1; then
+            echo "$current_time" > "$last_scrub_file"
+            log_info "Periodic scrub completed successfully"
+        else
+            log_warn "Periodic scrub encountered errors"
+        fi
     fi
 }
 
@@ -459,10 +626,31 @@ finalize_backup() {
 
     BACKUP_SUCCESSFUL=true
 
+    # Perform post-backup device error check
+    check_device_errors "${config[dest_mount]}" "post-backup" || {
+        log_warn "Device errors detected after backup - backup may be unreliable"
+    }
+
+    # Always perform scrub verification
+    verify_backup_with_scrub "$DEST_SNAP_DIR/$SNAP_NAME" "destination snapshot" || {
+        log_warn "Scrub verification detected issues with backup"
+    }
+
+    # Perform checksum sampling if configured
+    if [[ "${config[verify_sample_percent]:-0}" -gt 0 ]]; then
+        verify_data_checksums "$DEST_SNAP_DIR/$SNAP_NAME" || {
+            log_warn "Checksum verification detected issues with backup"
+        }
+    fi
+
     log_info "Syncing destination filesystem..."
     btrfs filesystem sync "${config[dest_mount]}"
 
-    log_info "YABB backup successful: ${SNAP_NAME@Q} ($backup_type)!"
+    if [[ "$VERIFICATION_PASSED" == "true" ]]; then
+        log_info "YABB backup successful: ${SNAP_NAME@Q} ($backup_type) - all verifications passed!"
+    else
+        log_warn "YABB backup completed with warnings: ${SNAP_NAME@Q} ($backup_type) - some verifications failed"
+    fi
 }
 
 cleanup() {
@@ -491,6 +679,11 @@ cleanup() {
         fi
     fi
 
+    # Adjust exit code based on verification status
+    if [[ "$exit_code" -eq 0 && "$BACKUP_SUCCESSFUL" == "true" && "$VERIFICATION_PASSED" != "true" ]]; then
+        exit_code=2  # Backup succeeded but verification found issues
+    fi
+
     exit $exit_code
 }
 
@@ -500,7 +693,7 @@ cleanup() {
 
 # Show version/help if requested
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
-    echo "YABB (Yet Another BTRFS Backup) v1.0.0"
+    echo "YABB (Yet Another BTRFS Backup) v1.4.0"
     exit 0
 fi
 
@@ -519,6 +712,12 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  Source Snapshots: ${config[source_vol]}/.yabb_snapshots"
     echo "  Destination: ${config[dest_mount]}"
     echo "  Destination Snapshots: ${config[dest_mount]}/.yabb_snapshots"
+    echo ""
+    echo "Verification Settings:"
+    echo "  Post-backup scrub: Always enabled"
+    echo "  Device error monitoring: Always enabled"
+    echo "  Checksum sampling: ${config[verify_sample_percent]}%"
+    echo "  Periodic scrub interval: ${config[minimum_days_between_scrubs]} days"
     exit 0
 fi
 
@@ -535,6 +734,10 @@ ensure_snapshot_directories
 
 # Acquire lock
 acquire_lock
+
+# Pre-backup device error check
+check_device_errors "${config[source_vol]}" "pre-backup"
+check_device_errors "${config[dest_mount]}" "pre-backup"
 
 # Create snapshot
 btrfs subvolume snapshot -r "${config[source_vol]}" "$SNAP_DIR/$SNAP_NAME" && \
@@ -594,4 +797,9 @@ if [[ "$BACKUP_SUCCESSFUL" == "true" && "${config[retention_days]:-0}" -gt 0 ]];
     log_info "Starting snapshot pruning (retention: ${config[retention_days]} days, keep minimum: ${config[keep_minimum]:-5})"
     prune_old_snapshots "$SNAP_DIR"
     prune_old_snapshots "$DEST_SNAP_DIR"
+fi
+
+# Schedule periodic scrub if enabled
+if [[ "$BACKUP_SUCCESSFUL" == "true" ]]; then
+    schedule_periodic_scrub "${config[dest_mount]}"
 fi
