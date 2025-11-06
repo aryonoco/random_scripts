@@ -24,7 +24,7 @@ WAIT_AFTER_REBOOT=60     # Seconds to wait after rebooting each container
 
 # List of container IDs to upgrade
 # Edit this array with your container IDs
-CONTAINERS=(402 403)
+CONTAINERS=(1001 1002 1003 1004 1005 1006 1007 1008 1009 1010 1011 1012)
 
 # You can also auto-detect all running Bookworm containers:
 # CONTAINERS=($(pct list | awk 'NR>1 {print $1}'))
