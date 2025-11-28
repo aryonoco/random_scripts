@@ -1,6 +1,6 @@
 #!/bin/sh
 # Portability:  Linux, *BSD, MacOS, Illumos (mktemp -d)
-# Dependencies: Tcl (>=8.5), exiftool, mutool or qpdf
+# Dependencies: Tcl (>=8.5), exiftool, mutool, qpdf
 set -eu
 
 echo() { printf '%s\n' "$*"; }
@@ -45,14 +45,14 @@ shift $((OPTIND - 1))
 
 
 workdir=$(mktemp -d)
-workfile=$workdir/work
+workfile=$workdir/work.pdf
 trap 'exit 1' HUP INT QUIT ${ZSH_VERSION-ABRT} TERM
 trap 'rm -r -- "$workdir"' EXIT
 
 # Tcl >=8.5 script to remove the Document Information Dictionary
 # Maybe parse the trailer to find the /Info ref and remove this object instead?
 cat <<'EOF' >"$workdir"/clean.tcl
-package require Tcl 8.5
+package require Tcl 8.5-
 namespace path {::tcl::mathop ::tcl::mathfunc}
 
 chan configure stdin -translation binary
@@ -90,14 +90,7 @@ EOF
 tclsh "$workdir"/clean.tcl <"$1" >"$workfile"
 exiftool -q -q -all:all= "$workfile"
 
-# Needs to be followed by linearization to truly remove XMP/EXIF data
-# cf https://exiftool.org/TagNames/PDF.html
-if has_cmd mutool
-then
-	mutool clean -l "$workfile" "$2"
-elif has_cmd qpdf
-then
-	qpdf --linearize "$workfile" "$2"
-else
-	die "Needs mutool or qpdf to linearize PDF output"
-fi
+# mutool: garbage collection and stream sanitization
+# qpdf: linearization to permanently remove metadata (mutool dropped -l support in 1.26)
+mutool clean -gggg -c -s "$workfile" "$workfile.clean"
+qpdf --linearize "$workfile.clean" "$2"
