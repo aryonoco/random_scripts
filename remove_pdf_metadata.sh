@@ -1,6 +1,6 @@
 #!/bin/sh
 # Portability:  Linux, *BSD, MacOS, Illumos (mktemp -d)
-# Dependencies: Tcl (>=8.5), exiftool, mutool, qpdf
+# Dependencies: mutool, qpdf, exiftool
 set -eu
 
 echo() { printf '%s\n' "$*"; }
@@ -49,48 +49,14 @@ workfile=$workdir/work.pdf
 trap 'exit 1' HUP INT QUIT ${ZSH_VERSION-ABRT} TERM
 trap 'rm -r -- "$workdir"' EXIT
 
-# Tcl >=8.5 script to remove the Document Information Dictionary
-# Maybe parse the trailer to find the /Info ref and remove this object instead?
-cat <<'EOF' >"$workdir"/clean.tcl
-package require Tcl 8.5-
-namespace path {::tcl::mathop ::tcl::mathfunc}
+# Step 1: mutool - garbage collection (-gggg), clean content streams (-c), sanitize (-s)
+mutool clean -gggg -c -s "$1" "$workfile"
 
-chan configure stdin -translation binary
-chan configure stdout -translation binary
-set data [read stdin]
+# Step 2: qpdf - remove XMP metadata stream and Document Info Dictionary
+qpdf --linearize --remove-metadata --remove-info "$workfile" "$workfile.clean"
 
-# Per ISO 32000, 4.18, EOL is CR, LF or CRLF
-set obj_re {\sobj(?:\r\n?|\n).*?(?:\r\n?|\n)endobj(?:\r\n?|\n)}
-set docinfo_key_re {/(?:Title|Subject|Keywords|Author|CreationDate|ModDate|Creator|Producer)[[:space:](]}
+# Step 3: exiftool - blank remaining dates (qpdf preserves ModifyDate by design)
+exiftool -q -overwrite_original -PDF:ModifyDate= -PDF:CreateDate= "$workfile.clean"
 
-set prev_end -1
-foreach match [regexp -indices -all -inline $obj_re $data] {
-	lassign $match start end
-	puts -nonewline [string range $data [+ $prev_end 1] [- $start 1]]
-	set match_data [string range $data $start $end]
-	# Try to detect Document Information Dictionary by the presence of key and the absence of
-	# (potentially misleading) stream
-	if {[string first "endstream" $match_data] == -1 && [regexp $docinfo_key_re $match_data]} {
-		set obj_header [lindex [regexp -inline {^\sobj(?:\r\n?|\n)} $match_data] 0]
-		set obj_footer [lindex [regexp -inline {(?:\r\n?|\n)endobj(?:\r\n?|\n)$} $match_data] 0]
-		set part1 "$obj_header<<\n"
-		set part2 "/Producer (anonymize_pdf.sh)\n>>$obj_footer"
-		# Needs padding to avoid breaking startxref
-		set padlen [- [string length $match_data] [string length $part1] [string length $part2]]
-		set pad "[string repeat " " [- $padlen 1]]\n"
-		puts -nonewline "$part1$pad$part2"
-	} else {
-		puts -nonewline $match_data
-	}
-	set prev_end $end
-}
-puts -nonewline [string range $data [+ $prev_end 1] [string length $data]]
-EOF
-
-tclsh "$workdir"/clean.tcl <"$1" >"$workfile"
-exiftool -q -q -all:all= "$workfile"
-
-# mutool: garbage collection and stream sanitization
-# qpdf: linearization to permanently remove metadata (mutool dropped -l support in 1.26)
-mutool clean -gggg -c -s "$workfile" "$workfile.clean"
+# Step 4: qpdf - re-linearize to permanently remove date metadata
 qpdf --linearize "$workfile.clean" "$2"
